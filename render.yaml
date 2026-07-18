@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: stayfind-api
+    env: node
+    plan: free
+    startCommand: node server.js
+    envVars:
+      - key: PI_SERVER_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: PORT
+        value: 4000
