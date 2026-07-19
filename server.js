@@ -10,6 +10,8 @@ app.use(express.json());
 app.use(cors({
   origin: [
     'https://stayfind-pi-booking.onrender.com',
+    'http://localhost:3000',
+    'http://localhost:3001',
     'http://localhost:5173',
     'http://localhost:5174',
     'http://localhost:5175',
@@ -33,6 +35,28 @@ function findPayment(paymentId) {
 function updatePayment(paymentId, update) {
   const idx = payments.findIndex(p => p.paymentId === paymentId);
   if (idx !== -1) Object.assign(payments[idx], update);
+}
+
+// ── In-memory bookings store ────────────────────────────────────────────────
+// NOTE: in-memory only — survives cold starts within the same process but is
+// wiped on redeploy/restart. Good enough to stop losing bookings on the
+// client's localStorage clear / device switch; a real DB is the next step.
+const bookings = [];
+
+function datesOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+function findConflict({ hotelId, roomType, checkIn, checkOut }, excludeId) {
+  const inStart = new Date(checkIn).getTime();
+  const inEnd = new Date(checkOut).getTime();
+  return bookings.find((b) =>
+    b.id !== excludeId &&
+    b.hotelId === hotelId &&
+    b.roomType === roomType &&
+    b.status !== 'cancelled' &&
+    datesOverlap(inStart, inEnd, new Date(b.checkIn).getTime(), new Date(b.checkOut).getTime())
+  );
 }
 
 // ── Admin key middleware ───────────────────────────────────────────────────
@@ -129,6 +153,51 @@ app.post('/api/payments/complete/:paymentId', async (req, res) => {
     console.error('[Complete] Error:', err);
     res.status(500).json({ error: String(err) });
   }
+});
+
+// ── Bookings: availability check ────────────────────────────────────────────
+app.get('/api/bookings/availability', (req, res) => {
+  const { hotelId, roomType, checkIn, checkOut } = req.query;
+  if (!hotelId || !roomType || !checkIn || !checkOut) {
+    return res.status(400).json({ error: 'hotelId, roomType, checkIn, checkOut required' });
+  }
+  const conflict = findConflict({ hotelId, roomType, checkIn, checkOut });
+  res.json({ available: !conflict });
+});
+
+// ── Bookings: create ─────────────────────────────────────────────────────────
+app.post('/api/bookings', (req, res) => {
+  const b = req.body || {};
+  const required = ['id', 'piUid', 'hotelId', 'roomType', 'checkIn', 'checkOut'];
+  const missing = required.filter((k) => !b[k]);
+  if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  const conflict = findConflict(b);
+  if (conflict) {
+    return res.status(409).json({ error: 'Room already booked for these dates', conflictId: conflict.id });
+  }
+
+  const booking = { ...b, status: b.status || 'confirmed', createdAt: new Date().toISOString() };
+  bookings.unshift(booking);
+  res.json(booking);
+});
+
+// ── Bookings: list by user ───────────────────────────────────────────────────
+app.get('/api/bookings/:piUid', (req, res) => {
+  const { piUid } = req.params;
+  res.json(bookings.filter((b) => b.piUid === piUid));
+});
+
+// ── Bookings: cancel ──────────────────────────────────────────────────────────
+app.post('/api/bookings/:id/cancel', (req, res) => {
+  const { id } = req.params;
+  const { piUid } = req.body || {};
+  const booking = bookings.find((b) => b.id === id);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  if (piUid && booking.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  booking.status = 'cancelled';
+  booking.cancelledAt = new Date().toISOString();
+  res.json(booking);
 });
 
 // ── Admin: stats ───────────────────────────────────────────────────────────
