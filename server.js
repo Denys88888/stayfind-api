@@ -1,10 +1,23 @@
 const express = require('express');
 const cors = require('cors');
+const StellarSdk = require('stellar-sdk');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const PI_SERVER_API_KEY = process.env.PI_SERVER_API_KEY;
+const PI_WALLET_PRIVATE_SEED = process.env.PI_WALLET_PRIVATE_SEED;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'stayfind-admin-dev';
+
+// Pi blockchain Horizon endpoints (per Pi Platform docs — separate from the
+// Platform API host). Picked based on the network the A2U payment reports.
+const HORIZON_URLS = {
+  'Pi Network': 'https://api.mainnet.minepi.com',
+  'Pi Testnet': 'https://api.testnet.minepi.com',
+};
+const NETWORK_PASSPHRASES = {
+  'Pi Network': 'Pi Network',
+  'Pi Testnet': 'Pi Testnet',
+};
 
 app.use(express.json());
 app.use(cors({
@@ -188,6 +201,93 @@ app.get('/api/bookings/:piUid', (req, res) => {
   res.json(bookings.filter((b) => b.piUid === piUid));
 });
 
+// ── Refunds: App-to-User Pi payment ─────────────────────────────────────────
+// Per Pi Platform docs, A2U payments are created via the Platform API (server
+// key) then signed and submitted to the Pi blockchain (a Stellar fork) using
+// the app wallet's own private seed, then marked complete via the Platform API.
+//
+// Without PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED configured, refunds are
+// recorded as 'pending_manual' instead of silently failing or (worse) faking
+// success — an admin must process them by hand until the seed is set.
+async function issueRefund(booking) {
+  if (!PI_SERVER_API_KEY || !PI_WALLET_PRIVATE_SEED) {
+    booking.refundStatus = 'pending_manual';
+    booking.refundNote = 'PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — refund must be sent manually';
+    console.warn(`[Refund] ${booking.id}: manual refund required (${booking.totalPi} π to uid ${booking.piUid})`);
+    return;
+  }
+
+  try {
+    // 1) Create the A2U payment record via the Platform API
+    const createRes = await fetch('https://api.minepi.com/v2/payments', {
+      method: 'POST',
+      headers: {
+        Authorization: `Key ${PI_SERVER_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        payment: {
+          amount: booking.totalPi,
+          memo: `StayFind refund: ${booking.id}`,
+          metadata: { bookingId: booking.id, reason: 'cancellation' },
+          uid: booking.piUid,
+        },
+      }),
+    });
+    const payment = await createRes.json();
+    if (!createRes.ok) throw new Error(`create payment failed: ${JSON.stringify(payment)}`);
+
+    const network = payment.network || 'Pi Testnet';
+    const horizonUrl = HORIZON_URLS[network];
+    const passphrase = NETWORK_PASSPHRASES[network];
+    if (!horizonUrl) throw new Error(`unknown network: ${network}`);
+
+    // 2) Sign and submit the Stellar-protocol transaction from the app wallet
+    const server = new StellarSdk.Server(horizonUrl);
+    const appKeypair = StellarSdk.Keypair.fromSecret(PI_WALLET_PRIVATE_SEED);
+    const account = await server.loadAccount(appKeypair.publicKey());
+
+    const tx = new StellarSdk.TransactionBuilder(account, {
+      fee: await server.fetchBaseFee().catch(() => '100000'),
+      networkPassphrase: passphrase,
+    })
+      .addOperation(
+        StellarSdk.Operation.payment({
+          destination: payment.recipient,
+          asset: StellarSdk.Asset.native(),
+          amount: String(payment.amount),
+        })
+      )
+      .addMemo(StellarSdk.Memo.text(payment.identifier))
+      .setTimeout(180)
+      .build();
+
+    tx.sign(appKeypair);
+    const submitResult = await server.submitTransaction(tx);
+    const txid = submitResult.hash;
+
+    // 3) Mark the payment complete via the Platform API
+    const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment.identifier}/complete`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Key ${PI_SERVER_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ txid }),
+    });
+    if (!completeRes.ok) throw new Error(`complete failed: ${await completeRes.text()}`);
+
+    booking.refundStatus = 'completed';
+    booking.refundTxid = txid;
+    booking.refundedAt = new Date().toISOString();
+    console.log(`[Refund] ${booking.id}: sent ${booking.totalPi} π, txid ${txid}`);
+  } catch (err) {
+    booking.refundStatus = 'failed';
+    booking.refundNote = String(err);
+    console.error(`[Refund] ${booking.id}: failed —`, err);
+  }
+}
+
 // ── Bookings: cancel ──────────────────────────────────────────────────────────
 app.post('/api/bookings/:id/cancel', (req, res) => {
   const { id } = req.params;
@@ -195,9 +295,24 @@ app.post('/api/bookings/:id/cancel', (req, res) => {
   const booking = bookings.find((b) => b.id === id);
   if (!booking) return res.status(404).json({ error: 'Booking not found' });
   if (piUid && booking.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+
+  const alreadyCancelled = booking.status === 'cancelled';
   booking.status = 'cancelled';
   booking.cancelledAt = new Date().toISOString();
+
+  // Only refund real Pi payments (skip demo/mock txids) and only once.
+  const isRealPayment = booking.txid && !String(booking.txid).startsWith('demo_');
+  if (!alreadyCancelled && isRealPayment && booking.totalPi && !booking.refundStatus) {
+    booking.refundStatus = 'processing';
+    issueRefund(booking); // fire-and-forget — cancellation itself must not block on this
+  }
+
   res.json(booking);
+});
+
+// ── Admin: refunds needing manual processing ────────────────────────────────
+app.get('/api/admin/refunds', requireAdmin, (_req, res) => {
+  res.json(bookings.filter((b) => b.refundStatus === 'pending_manual' || b.refundStatus === 'failed'));
 });
 
 // ── Admin: stats ───────────────────────────────────────────────────────────
