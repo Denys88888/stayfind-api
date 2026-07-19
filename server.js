@@ -259,3 +259,11 @@ app.listen(PORT, () => {
   }
   console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
 });
+
+// ── Keep-alive: free-tier Render sleeps after idle; a cold start during
+//    payment approval breaks the Pi flow ("developer failed to approve").
+//    Self-ping every 10 min keeps the service warm.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://stayfind-api.onrender.com';
+setInterval(() => {
+  fetch(`${SELF_URL}/health`).catch(() => {});
+}, 10 * 60 * 1000);
