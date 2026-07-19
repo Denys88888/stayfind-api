@@ -436,6 +436,72 @@ app.get('/api/admin/config', requireAdmin, (_req, res) => {
   });
 });
 
+// ── User-submitted listings (in-memory) ─────────────────────────────────────
+// Any Pi user can submit a property. New listings start 'pending' and only
+// show up publicly once an admin approves them via /api/admin/listings —
+// unmoderated public listings on a payments-enabled site is a spam/abuse risk.
+const listings = [];
+
+app.post('/api/listings', (req, res) => {
+  const l = req.body || {};
+  const required = ['ownerUid', 'name', 'location', 'address', 'price', 'description'];
+  const missing = required.filter((k) => !l[k]);
+  if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  const listing = {
+    id: Date.now() + Math.floor(Math.random() * 1000),
+    ownerUid: l.ownerUid,
+    name: String(l.name),
+    location: String(l.location),
+    address: String(l.address),
+    price: Number(l.price),
+    description: String(l.description),
+    images: Array.isArray(l.images) && l.images.length ? l.images.slice(0, 8) : ['/hotel-1.jpg'],
+    amenities: Array.isArray(l.amenities) ? l.amenities : [],
+    propertyType: l.propertyType || 'Hotel',
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  listings.unshift(listing);
+  res.json(listing);
+});
+
+// Public: only approved listings
+app.get('/api/listings', (_req, res) => {
+  res.json(listings.filter((l) => l.status === 'approved'));
+});
+
+app.get('/api/listings/owner/:piUid', (req, res) => {
+  res.json(listings.filter((l) => l.ownerUid === req.params.piUid));
+});
+
+app.get('/api/listings/:id', (req, res) => {
+  const listing = listings.find((l) => String(l.id) === req.params.id && l.status === 'approved');
+  if (!listing) return res.status(404).json({ error: 'Not found' });
+  res.json(listing);
+});
+
+// Admin: moderation queue
+app.get('/api/admin/listings', requireAdmin, (req, res) => {
+  const { status } = req.query;
+  res.json(status ? listings.filter((l) => l.status === status) : listings);
+});
+
+app.post('/api/admin/listings/:id/approve', requireAdmin, (req, res) => {
+  const listing = listings.find((l) => String(l.id) === req.params.id);
+  if (!listing) return res.status(404).json({ error: 'Not found' });
+  listing.status = 'approved';
+  res.json(listing);
+});
+
+app.post('/api/admin/listings/:id/reject', requireAdmin, (req, res) => {
+  const listing = listings.find((l) => String(l.id) === req.params.id);
+  if (!listing) return res.status(404).json({ error: 'Not found' });
+  listing.status = 'rejected';
+  listing.rejectReason = req.body?.reason;
+  res.json(listing);
+});
+
 app.listen(PORT, () => {
   console.log(`StayFind API listening on port ${PORT}`);
   if (!PI_SERVER_API_KEY) {
