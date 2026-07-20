@@ -63,6 +63,11 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// ── Public config (no admin key needed — safe, non-sensitive values) ───────
+app.get('/api/config', (_req, res) => {
+  res.json({ platformCommissionRate: PLATFORM_COMMISSION_RATE });
+});
+
 // ── Payments: approve ──────────────────────────────────────────────────────
 app.post('/api/payments/approve/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
@@ -170,6 +175,20 @@ app.post('/api/bookings', async (req, res) => {
   }
 
   const booking = { ...b, status: b.status || 'confirmed', createdAt: new Date().toISOString() };
+
+  // Escrow: if this booking is on a user-submitted listing, hold the guest's
+  // payment and schedule a payout (minus platform commission) to the host,
+  // released once the stay's checkout date passes. Static demo hotels have
+  // no real host, so they're skipped — full amount is platform revenue as before.
+  const listing = await store.getListingById(b.hotelId).catch(() => null);
+  if (listing && listing.ownerUid && listing.ownerUid !== b.piUid && b.totalPi) {
+    booking.hostUid = listing.ownerUid;
+    booking.platformFeeRate = PLATFORM_COMMISSION_RATE;
+    booking.platformFeeAmount = Math.round(b.totalPi * PLATFORM_COMMISSION_RATE * 100) / 100;
+    booking.hostPayoutAmount = Math.round((b.totalPi - booking.platformFeeAmount) * 100) / 100;
+    booking.hostPayoutStatus = 'held';
+  }
+
   await store.createBooking(booking);
   res.json(booking);
 });
@@ -180,84 +199,80 @@ app.get('/api/bookings/:piUid', async (req, res) => {
   res.json(await store.getBookingsByOwner(piUid));
 });
 
-// ── Refunds: App-to-User Pi payment ─────────────────────────────────────────
+// ── Bookings: earnings on a host's listings ─────────────────────────────────
+app.get('/api/bookings/host/:hostUid', async (req, res) => {
+  res.json(await store.getBookingsByHost(req.params.hostUid));
+});
+
+// ── App-to-User Pi payments (shared by refunds and host payouts) ───────────
 // Per Pi Platform docs, A2U payments are created via the Platform API (server
 // key) then signed and submitted to the Pi blockchain (a Stellar fork) using
 // the app wallet's own private seed, then marked complete via the Platform API.
-//
+async function sendA2UPayment({ uid, amount, memo, metadata }) {
+  if (!PI_SERVER_API_KEY || !PI_WALLET_PRIVATE_SEED) {
+    throw new Error('PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — payment must be sent manually');
+  }
+
+  // 1) Create the A2U payment record via the Platform API
+  const createRes = await fetch('https://api.minepi.com/v2/payments', {
+    method: 'POST',
+    headers: { Authorization: `Key ${PI_SERVER_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ payment: { amount, memo, metadata, uid } }),
+  });
+  const payment = await createRes.json();
+  if (!createRes.ok) throw new Error(`create payment failed: ${JSON.stringify(payment)}`);
+
+  const network = payment.network || 'Pi Testnet';
+  const horizonUrl = HORIZON_URLS[network];
+  const passphrase = NETWORK_PASSPHRASES[network];
+  if (!horizonUrl) throw new Error(`unknown network: ${network}`);
+
+  // 2) Sign and submit the Stellar-protocol transaction from the app wallet
+  const server = new StellarSdk.Server(horizonUrl);
+  const appKeypair = StellarSdk.Keypair.fromSecret(PI_WALLET_PRIVATE_SEED);
+  const account = await server.loadAccount(appKeypair.publicKey());
+
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: await server.fetchBaseFee().catch(() => '100000'),
+    networkPassphrase: passphrase,
+  })
+    .addOperation(
+      StellarSdk.Operation.payment({
+        destination: payment.recipient,
+        asset: StellarSdk.Asset.native(),
+        amount: String(payment.amount),
+      })
+    )
+    .addMemo(StellarSdk.Memo.text(payment.identifier))
+    .setTimeout(180)
+    .build();
+
+  tx.sign(appKeypair);
+  const submitResult = await server.submitTransaction(tx);
+  const txid = submitResult.hash;
+
+  // 3) Mark the payment complete via the Platform API
+  const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment.identifier}/complete`, {
+    method: 'POST',
+    headers: { Authorization: `Key ${PI_SERVER_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txid }),
+  });
+  if (!completeRes.ok) throw new Error(`complete failed: ${await completeRes.text()}`);
+
+  return txid;
+}
+
 // Without PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED configured, refunds are
 // recorded as 'pending_manual' instead of silently failing or (worse) faking
 // success — an admin must process them by hand until the seed is set.
 async function issueRefund(booking) {
-  if (!PI_SERVER_API_KEY || !PI_WALLET_PRIVATE_SEED) {
-    await store.updateBooking(booking.id, {
-      refundStatus: 'pending_manual',
-      refundNote: 'PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — refund must be sent manually',
-    });
-    console.warn(`[Refund] ${booking.id}: manual refund required (${booking.totalPi} π to uid ${booking.piUid})`);
-    return;
-  }
-
   try {
-    // 1) Create the A2U payment record via the Platform API
-    const createRes = await fetch('https://api.minepi.com/v2/payments', {
-      method: 'POST',
-      headers: {
-        Authorization: `Key ${PI_SERVER_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        payment: {
-          amount: booking.totalPi,
-          memo: `StayFind refund: ${booking.id}`,
-          metadata: { bookingId: booking.id, reason: 'cancellation' },
-          uid: booking.piUid,
-        },
-      }),
+    const txid = await sendA2UPayment({
+      uid: booking.piUid,
+      amount: booking.totalPi,
+      memo: `StayFind refund: ${booking.id}`,
+      metadata: { bookingId: booking.id, reason: 'cancellation' },
     });
-    const payment = await createRes.json();
-    if (!createRes.ok) throw new Error(`create payment failed: ${JSON.stringify(payment)}`);
-
-    const network = payment.network || 'Pi Testnet';
-    const horizonUrl = HORIZON_URLS[network];
-    const passphrase = NETWORK_PASSPHRASES[network];
-    if (!horizonUrl) throw new Error(`unknown network: ${network}`);
-
-    // 2) Sign and submit the Stellar-protocol transaction from the app wallet
-    const server = new StellarSdk.Server(horizonUrl);
-    const appKeypair = StellarSdk.Keypair.fromSecret(PI_WALLET_PRIVATE_SEED);
-    const account = await server.loadAccount(appKeypair.publicKey());
-
-    const tx = new StellarSdk.TransactionBuilder(account, {
-      fee: await server.fetchBaseFee().catch(() => '100000'),
-      networkPassphrase: passphrase,
-    })
-      .addOperation(
-        StellarSdk.Operation.payment({
-          destination: payment.recipient,
-          asset: StellarSdk.Asset.native(),
-          amount: String(payment.amount),
-        })
-      )
-      .addMemo(StellarSdk.Memo.text(payment.identifier))
-      .setTimeout(180)
-      .build();
-
-    tx.sign(appKeypair);
-    const submitResult = await server.submitTransaction(tx);
-    const txid = submitResult.hash;
-
-    // 3) Mark the payment complete via the Platform API
-    const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment.identifier}/complete`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Key ${PI_SERVER_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ txid }),
-    });
-    if (!completeRes.ok) throw new Error(`complete failed: ${await completeRes.text()}`);
-
     await store.updateBooking(booking.id, {
       refundStatus: 'completed',
       refundTxid: txid,
@@ -265,9 +280,56 @@ async function issueRefund(booking) {
     });
     console.log(`[Refund] ${booking.id}: sent ${booking.totalPi} π, txid ${txid}`);
   } catch (err) {
-    await store.updateBooking(booking.id, { refundStatus: 'failed', refundNote: String(err) });
-    console.error(`[Refund] ${booking.id}: failed —`, err);
+    const status = /not configured/.test(String(err)) ? 'pending_manual' : 'failed';
+    await store.updateBooking(booking.id, { refundStatus: status, refundNote: String(err) });
+    if (status === 'pending_manual') {
+      console.warn(`[Refund] ${booking.id}: manual refund required (${booking.totalPi} π to uid ${booking.piUid})`);
+    } else {
+      console.error(`[Refund] ${booking.id}: failed —`, err);
+    }
   }
+}
+
+// ── Host payouts: escrow release ────────────────────────────────────────────
+// The platform holds guest payment in its own wallet until the stay's
+// checkout date passes (escrow), then pays the host their share minus the
+// platform commission. Only applies to bookings on user-submitted listings —
+// the static demo catalog has no real host to pay.
+const PLATFORM_COMMISSION_RATE = Number(process.env.PLATFORM_COMMISSION_RATE || '0.08');
+
+async function issueHostPayout(booking) {
+  try {
+    const txid = await sendA2UPayment({
+      uid: booking.hostUid,
+      amount: booking.hostPayoutAmount,
+      memo: `StayFind payout: ${booking.id}`,
+      metadata: { bookingId: booking.id, reason: 'host_payout' },
+    });
+    await store.updateBooking(booking.id, {
+      hostPayoutStatus: 'completed',
+      hostPayoutTxid: txid,
+      hostPayoutAt: new Date().toISOString(),
+    });
+    console.log(`[Payout] ${booking.id}: sent ${booking.hostPayoutAmount} π to host ${booking.hostUid}, txid ${txid}`);
+  } catch (err) {
+    const status = /not configured/.test(String(err)) ? 'pending_manual' : 'failed';
+    await store.updateBooking(booking.id, { hostPayoutStatus: status, hostPayoutNote: String(err) });
+    if (status === 'pending_manual') {
+      console.warn(`[Payout] ${booking.id}: manual payout required (${booking.hostPayoutAmount} π to uid ${booking.hostUid})`);
+    } else {
+      console.error(`[Payout] ${booking.id}: failed —`, err);
+    }
+  }
+}
+
+// Scan for bookings whose stay has ended and release the held escrow.
+async function releaseDuePayouts() {
+  const due = await store.getBookingsDueForPayout();
+  for (const booking of due) {
+    await store.updateBooking(booking.id, { hostPayoutStatus: 'processing' });
+    await issueHostPayout(booking);
+  }
+  if (due.length) console.log(`[Payout] released ${due.length} escrow payout(s)`);
 }
 
 // ── Bookings: cancel ──────────────────────────────────────────────────────────
@@ -281,11 +343,15 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
   const alreadyCancelled = existing.status === 'cancelled';
   const isRealPayment = existing.txid && !String(existing.txid).startsWith('demo_');
   const shouldRefund = !alreadyCancelled && isRealPayment && existing.totalPi && !existing.refundStatus;
+  // If a host payout was held in escrow and hasn't gone out yet, cancelling
+  // the booking cancels the payout too — the guest is getting refunded instead.
+  const shouldCancelPayout = !alreadyCancelled && existing.hostUid && existing.hostPayoutStatus === 'held';
 
   const booking = await store.updateBooking(id, {
     status: 'cancelled',
     cancelledAt: new Date().toISOString(),
     ...(shouldRefund ? { refundStatus: 'processing' } : {}),
+    ...(shouldCancelPayout ? { hostPayoutStatus: 'cancelled' } : {}),
   });
 
   // Only refund real Pi payments (skip demo/mock txids) and only once.
@@ -296,9 +362,26 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
   res.json(booking);
 });
 
-// ── Admin: refunds needing manual processing ────────────────────────────────
-app.get('/api/admin/refunds', requireAdmin, (_req, res) => {
-  res.json(bookings.filter((b) => b.refundStatus === 'pending_manual' || b.refundStatus === 'failed'));
+// ── Admin: refunds / payouts needing manual processing ─────────────────────
+app.get('/api/admin/refunds', requireAdmin, async (_req, res) => {
+  const all = await store.getAllBookings();
+  res.json(all.filter((b) => b.refundStatus === 'pending_manual' || b.refundStatus === 'failed'));
+});
+
+app.get('/api/admin/payouts', requireAdmin, async (_req, res) => {
+  const all = await store.getAllBookings();
+  res.json(all.filter((b) => b.hostUid));
+});
+
+app.post('/api/admin/bookings/:id/release-payout', requireAdmin, async (req, res) => {
+  const booking = await store.getBookingById(req.params.id);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  if (!booking.hostUid) return res.status(400).json({ error: 'Booking has no host payout' });
+  if (booking.hostPayoutStatus === 'completed') return res.status(400).json({ error: 'Already paid out' });
+
+  await store.updateBooking(booking.id, { hostPayoutStatus: 'processing' });
+  await issueHostPayout(booking);
+  res.json(await store.getBookingById(booking.id));
 });
 
 // ── Admin: stats ───────────────────────────────────────────────────────────
@@ -413,6 +496,7 @@ app.get('/api/admin/config', requireAdmin, (_req, res) => {
   res.json({
     mode: PI_SERVER_API_KEY ? 'REAL' : 'MOCK',
     piApiBase: 'https://api.minepi.com',
+    platformCommissionRate: PLATFORM_COMMISSION_RATE,
     corsOrigins: [
       'https://stayfind-pi-booking.onrender.com',
       'http://localhost:5173',
@@ -501,6 +585,8 @@ store.init()
         console.warn('PI_SERVER_API_KEY not set — running in mock mode');
       }
       console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
+      console.log(`Platform commission: ${(PLATFORM_COMMISSION_RATE * 100).toFixed(1)}%`);
+      releaseDuePayouts().catch((err) => console.error('[Payout] initial scan failed:', err));
     });
   });
 
@@ -511,3 +597,9 @@ const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://stayfind-api.onrend
 setInterval(() => {
   fetch(`${SELF_URL}/health`).catch(() => {});
 }, 10 * 60 * 1000);
+
+// ── Escrow release: check every 30 min for bookings whose checkout date has
+//    passed and release the held payout to the host.
+setInterval(() => {
+  releaseDuePayouts().catch((err) => console.error('[Payout] scan failed:', err));
+}, 30 * 60 * 1000);

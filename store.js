@@ -127,6 +127,39 @@ async function getBookingById(id) {
   return memBookings.find((b) => b.id === id) || null;
 }
 
+async function getBookingsByHost(hostUid) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT data FROM bookings WHERE data->>'hostUid' = $1 ORDER BY created_at DESC`,
+      [hostUid]
+    );
+    return rows.map((r) => r.data);
+  }
+  return memBookings.filter((b) => b.hostUid === hostUid);
+}
+
+async function getAllBookings() {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT data FROM bookings ORDER BY created_at DESC`);
+    return rows.map((r) => r.data);
+  }
+  return memBookings;
+}
+
+async function getBookingsDueForPayout() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT data FROM bookings WHERE status = 'confirmed' AND check_out < $1`,
+      [today]
+    );
+    return rows.map((r) => r.data).filter((b) => b.hostUid && b.hostPayoutStatus === 'held');
+  }
+  return memBookings.filter(
+    (b) => b.status === 'confirmed' && b.hostUid && b.hostPayoutStatus === 'held' && b.checkOut < today
+  );
+}
+
 async function updateBooking(id, patch) {
   const current = await getBookingById(id);
   if (!current) return null;
@@ -212,6 +245,9 @@ module.exports = {
   createBooking,
   getBookingsByOwner,
   getBookingById,
+  getBookingsByHost,
+  getAllBookings,
+  getBookingsDueForPayout,
   updateBooking,
   createListing,
   getApprovedListings,

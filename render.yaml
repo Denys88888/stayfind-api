@@ -8,7 +8,10 @@ services:
       - key: PI_SERVER_API_KEY
         sync: false  # Set manually in Render dashboard
       - key: PI_WALLET_PRIVATE_SEED
-        sync: false  # App wallet seed for Pi refunds — from Pi Developer Portal
+        sync: false  # App wallet seed for Pi refunds/payouts — from Pi Developer Portal
+      - key: PLATFORM_COMMISSION_RATE
+        sync: false  # Optional: fraction (0.02–0.10) kept from user-listing bookings
+                      # before paying the host. Defaults to 0.08 (8%) if unset.
       - key: DATABASE_URL
         sync: false  # Optional: Postgres connection string. Without it,
                       # bookings/listings are in-memory and lost on redeploy.
