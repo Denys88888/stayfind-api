@@ -55,6 +55,18 @@ async function init() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_listings_owner ON listings(owner_uid);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reviews (
+      id TEXT PRIMARY KEY,
+      booking_id TEXT NOT NULL UNIQUE,
+      hotel_id TEXT NOT NULL,
+      pi_uid TEXT NOT NULL,
+      data JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_reviews_hotel_id ON reviews(hotel_id);`);
+
   console.log('[Store] Postgres connected, tables ready');
 }
 
@@ -63,6 +75,7 @@ async function init() {
 /* ------------------------------------------------------------------ */
 const memBookings = [];
 const memListings = [];
+const memReviews = [];
 
 function datesOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
@@ -238,6 +251,41 @@ async function updateListing(id, patch) {
   return updated;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Reviews                                                             */
+/* ------------------------------------------------------------------ */
+
+async function createReview(review) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO reviews (id, booking_id, hotel_id, pi_uid, data) VALUES ($1, $2, $3, $4, $5)`,
+      [review.id, review.bookingId, review.hotelId, review.piUid, review]
+    );
+    return review;
+  }
+  memReviews.unshift(review);
+  return review;
+}
+
+async function getReviewByBooking(bookingId) {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT data FROM reviews WHERE booking_id = $1`, [bookingId]);
+    return rows[0]?.data || null;
+  }
+  return memReviews.find((r) => r.bookingId === bookingId) || null;
+}
+
+async function getReviewsByHotel(hotelId) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT data FROM reviews WHERE hotel_id = $1 ORDER BY created_at DESC`,
+      [hotelId]
+    );
+    return rows.map((r) => r.data);
+  }
+  return memReviews.filter((r) => r.hotelId === hotelId);
+}
+
 module.exports = {
   isEnabled,
   init,
@@ -255,4 +303,7 @@ module.exports = {
   getListingById,
   getAllListings,
   updateListing,
+  createReview,
+  getReviewByBooking,
+  getReviewsByHotel,
 };

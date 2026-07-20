@@ -551,6 +551,49 @@ app.get('/api/listings/:id', async (req, res) => {
   res.json(listing);
 });
 
+// ── Reviews ──────────────────────────────────────────────────────────────────
+// A review can only be left once per booking, only by the guest who made it,
+// and only after the stay's checkout date has passed — no reviewing a stay
+// that hasn't happened yet, and no one but the actual guest can post one.
+app.get('/api/reviews/:hotelId', async (req, res) => {
+  res.json(await store.getReviewsByHotel(req.params.hotelId));
+});
+
+app.post('/api/reviews', async (req, res) => {
+  const { bookingId, piUid, rating, text, authorName } = req.body || {};
+  if (!bookingId || !piUid || !rating || !text) {
+    return res.status(400).json({ error: 'bookingId, piUid, rating, text required' });
+  }
+  const ratingNum = Number(rating);
+  if (!Number.isFinite(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+    return res.status(400).json({ error: 'rating must be between 1 and 5' });
+  }
+
+  const booking = await store.getBookingById(bookingId);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
+  if (booking.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (booking.status === 'cancelled') return res.status(400).json({ error: 'Cannot review a cancelled booking' });
+  if (new Date(booking.checkOut) > new Date()) {
+    return res.status(400).json({ error: 'Cannot review a stay that has not ended yet' });
+  }
+
+  const existing = await store.getReviewByBooking(bookingId);
+  if (existing) return res.status(409).json({ error: 'Already reviewed' });
+
+  const review = {
+    id: `RV-${Date.now()}${Math.floor(Math.random() * 1000)}`,
+    bookingId,
+    hotelId: booking.hotelId,
+    piUid,
+    authorName: String(authorName || 'Pi traveler').slice(0, 60),
+    rating: ratingNum,
+    text: String(text).slice(0, 2000),
+    createdAt: new Date().toISOString(),
+  };
+  await store.createReview(review);
+  res.json(review);
+});
+
 // Admin: moderation queue
 app.get('/api/admin/listings', requireAdmin, async (req, res) => {
   const { status } = req.query;
