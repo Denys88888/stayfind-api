@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const StellarSdk = require('stellar-sdk');
+const store = require('./store');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -48,28 +49,6 @@ function findPayment(paymentId) {
 function updatePayment(paymentId, update) {
   const idx = payments.findIndex(p => p.paymentId === paymentId);
   if (idx !== -1) Object.assign(payments[idx], update);
-}
-
-// ── In-memory bookings store ────────────────────────────────────────────────
-// NOTE: in-memory only — survives cold starts within the same process but is
-// wiped on redeploy/restart. Good enough to stop losing bookings on the
-// client's localStorage clear / device switch; a real DB is the next step.
-const bookings = [];
-
-function datesOverlap(aStart, aEnd, bStart, bEnd) {
-  return aStart < bEnd && bStart < aEnd;
-}
-
-function findConflict({ hotelId, roomType, checkIn, checkOut }, excludeId) {
-  const inStart = new Date(checkIn).getTime();
-  const inEnd = new Date(checkOut).getTime();
-  return bookings.find((b) =>
-    b.id !== excludeId &&
-    b.hotelId === hotelId &&
-    b.roomType === roomType &&
-    b.status !== 'cancelled' &&
-    datesOverlap(inStart, inEnd, new Date(b.checkIn).getTime(), new Date(b.checkOut).getTime())
-  );
 }
 
 // ── Admin key middleware ───────────────────────────────────────────────────
@@ -169,36 +148,36 @@ app.post('/api/payments/complete/:paymentId', async (req, res) => {
 });
 
 // ── Bookings: availability check ────────────────────────────────────────────
-app.get('/api/bookings/availability', (req, res) => {
+app.get('/api/bookings/availability', async (req, res) => {
   const { hotelId, roomType, checkIn, checkOut } = req.query;
   if (!hotelId || !roomType || !checkIn || !checkOut) {
     return res.status(400).json({ error: 'hotelId, roomType, checkIn, checkOut required' });
   }
-  const conflict = findConflict({ hotelId, roomType, checkIn, checkOut });
+  const conflict = await store.findBookingConflict({ hotelId, roomType, checkIn, checkOut });
   res.json({ available: !conflict });
 });
 
 // ── Bookings: create ─────────────────────────────────────────────────────────
-app.post('/api/bookings', (req, res) => {
+app.post('/api/bookings', async (req, res) => {
   const b = req.body || {};
   const required = ['id', 'piUid', 'hotelId', 'roomType', 'checkIn', 'checkOut'];
   const missing = required.filter((k) => !b[k]);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
 
-  const conflict = findConflict(b);
+  const conflict = await store.findBookingConflict(b);
   if (conflict) {
     return res.status(409).json({ error: 'Room already booked for these dates', conflictId: conflict.id });
   }
 
   const booking = { ...b, status: b.status || 'confirmed', createdAt: new Date().toISOString() };
-  bookings.unshift(booking);
+  await store.createBooking(booking);
   res.json(booking);
 });
 
 // ── Bookings: list by user ───────────────────────────────────────────────────
-app.get('/api/bookings/:piUid', (req, res) => {
+app.get('/api/bookings/:piUid', async (req, res) => {
   const { piUid } = req.params;
-  res.json(bookings.filter((b) => b.piUid === piUid));
+  res.json(await store.getBookingsByOwner(piUid));
 });
 
 // ── Refunds: App-to-User Pi payment ─────────────────────────────────────────
@@ -211,8 +190,10 @@ app.get('/api/bookings/:piUid', (req, res) => {
 // success — an admin must process them by hand until the seed is set.
 async function issueRefund(booking) {
   if (!PI_SERVER_API_KEY || !PI_WALLET_PRIVATE_SEED) {
-    booking.refundStatus = 'pending_manual';
-    booking.refundNote = 'PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — refund must be sent manually';
+    await store.updateBooking(booking.id, {
+      refundStatus: 'pending_manual',
+      refundNote: 'PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — refund must be sent manually',
+    });
     console.warn(`[Refund] ${booking.id}: manual refund required (${booking.totalPi} π to uid ${booking.piUid})`);
     return;
   }
@@ -277,33 +258,38 @@ async function issueRefund(booking) {
     });
     if (!completeRes.ok) throw new Error(`complete failed: ${await completeRes.text()}`);
 
-    booking.refundStatus = 'completed';
-    booking.refundTxid = txid;
-    booking.refundedAt = new Date().toISOString();
+    await store.updateBooking(booking.id, {
+      refundStatus: 'completed',
+      refundTxid: txid,
+      refundedAt: new Date().toISOString(),
+    });
     console.log(`[Refund] ${booking.id}: sent ${booking.totalPi} π, txid ${txid}`);
   } catch (err) {
-    booking.refundStatus = 'failed';
-    booking.refundNote = String(err);
+    await store.updateBooking(booking.id, { refundStatus: 'failed', refundNote: String(err) });
     console.error(`[Refund] ${booking.id}: failed —`, err);
   }
 }
 
 // ── Bookings: cancel ──────────────────────────────────────────────────────────
-app.post('/api/bookings/:id/cancel', (req, res) => {
+app.post('/api/bookings/:id/cancel', async (req, res) => {
   const { id } = req.params;
   const { piUid } = req.body || {};
-  const booking = bookings.find((b) => b.id === id);
-  if (!booking) return res.status(404).json({ error: 'Booking not found' });
-  if (piUid && booking.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  const existing = await store.getBookingById(id);
+  if (!existing) return res.status(404).json({ error: 'Booking not found' });
+  if (piUid && existing.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
 
-  const alreadyCancelled = booking.status === 'cancelled';
-  booking.status = 'cancelled';
-  booking.cancelledAt = new Date().toISOString();
+  const alreadyCancelled = existing.status === 'cancelled';
+  const isRealPayment = existing.txid && !String(existing.txid).startsWith('demo_');
+  const shouldRefund = !alreadyCancelled && isRealPayment && existing.totalPi && !existing.refundStatus;
+
+  const booking = await store.updateBooking(id, {
+    status: 'cancelled',
+    cancelledAt: new Date().toISOString(),
+    ...(shouldRefund ? { refundStatus: 'processing' } : {}),
+  });
 
   // Only refund real Pi payments (skip demo/mock txids) and only once.
-  const isRealPayment = booking.txid && !String(booking.txid).startsWith('demo_');
-  if (!alreadyCancelled && isRealPayment && booking.totalPi && !booking.refundStatus) {
-    booking.refundStatus = 'processing';
+  if (shouldRefund) {
     issueRefund(booking); // fire-and-forget — cancellation itself must not block on this
   }
 
@@ -326,6 +312,7 @@ app.get('/api/admin/stats', requireAdmin, (_req, res) => {
   res.json({
     mode: PI_SERVER_API_KEY ? 'REAL' : 'MOCK',
     sandbox: !PI_SERVER_API_KEY,
+    storage: store.isEnabled ? 'POSTGRES' : 'IN_MEMORY',
     uptime: Math.floor(process.uptime()),
     total: payments.length,
     todayTotal: todayPayments.length,
@@ -436,13 +423,12 @@ app.get('/api/admin/config', requireAdmin, (_req, res) => {
   });
 });
 
-// ── User-submitted listings (in-memory) ─────────────────────────────────────
+// ── User-submitted listings ──────────────────────────────────────────────────
 // Any Pi user can submit a property. New listings start 'pending' and only
 // show up publicly once an admin approves them via /api/admin/listings —
 // unmoderated public listings on a payments-enabled site is a spam/abuse risk.
-const listings = [];
 
-app.post('/api/listings', (req, res) => {
+app.post('/api/listings', async (req, res) => {
   const l = req.body || {};
   const required = ['ownerUid', 'name', 'location', 'address', 'price', 'description'];
   const missing = required.filter((k) => !l[k]);
@@ -462,53 +448,61 @@ app.post('/api/listings', (req, res) => {
     status: 'pending',
     createdAt: new Date().toISOString(),
   };
-  listings.unshift(listing);
+  await store.createListing(listing);
   res.json(listing);
 });
 
 // Public: only approved listings
-app.get('/api/listings', (_req, res) => {
-  res.json(listings.filter((l) => l.status === 'approved'));
+app.get('/api/listings', async (_req, res) => {
+  res.json(await store.getApprovedListings());
 });
 
-app.get('/api/listings/owner/:piUid', (req, res) => {
-  res.json(listings.filter((l) => l.ownerUid === req.params.piUid));
+app.get('/api/listings/owner/:piUid', async (req, res) => {
+  res.json(await store.getListingsByOwner(req.params.piUid));
 });
 
-app.get('/api/listings/:id', (req, res) => {
-  const listing = listings.find((l) => String(l.id) === req.params.id && l.status === 'approved');
-  if (!listing) return res.status(404).json({ error: 'Not found' });
+app.get('/api/listings/:id', async (req, res) => {
+  const listing = await store.getListingById(req.params.id);
+  if (!listing || listing.status !== 'approved') return res.status(404).json({ error: 'Not found' });
   res.json(listing);
 });
 
 // Admin: moderation queue
-app.get('/api/admin/listings', requireAdmin, (req, res) => {
+app.get('/api/admin/listings', requireAdmin, async (req, res) => {
   const { status } = req.query;
-  res.json(status ? listings.filter((l) => l.status === status) : listings);
+  res.json(await store.getAllListings(status));
 });
 
-app.post('/api/admin/listings/:id/approve', requireAdmin, (req, res) => {
-  const listing = listings.find((l) => String(l.id) === req.params.id);
+app.post('/api/admin/listings/:id/approve', requireAdmin, async (req, res) => {
+  const listing = await store.updateListing(req.params.id, { status: 'approved' });
   if (!listing) return res.status(404).json({ error: 'Not found' });
-  listing.status = 'approved';
   res.json(listing);
 });
 
-app.post('/api/admin/listings/:id/reject', requireAdmin, (req, res) => {
-  const listing = listings.find((l) => String(l.id) === req.params.id);
+app.post('/api/admin/listings/:id/reject', requireAdmin, async (req, res) => {
+  const listing = await store.updateListing(req.params.id, { status: 'rejected', rejectReason: req.body?.reason });
   if (!listing) return res.status(404).json({ error: 'Not found' });
-  listing.status = 'rejected';
-  listing.rejectReason = req.body?.reason;
   res.json(listing);
 });
 
-app.listen(PORT, () => {
-  console.log(`StayFind API listening on port ${PORT}`);
-  if (!PI_SERVER_API_KEY) {
-    console.warn('PI_SERVER_API_KEY not set — running in mock mode');
-  }
-  console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
-});
+store.init()
+  .then(() => {
+    if (!store.isEnabled) {
+      console.warn('DATABASE_URL not set — bookings/listings are in-memory and will be lost on redeploy');
+    }
+  })
+  .catch((err) => {
+    console.error('[Store] Postgres init failed, falling back to in-memory:', err);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`StayFind API listening on port ${PORT}`);
+      if (!PI_SERVER_API_KEY) {
+        console.warn('PI_SERVER_API_KEY not set — running in mock mode');
+      }
+      console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
+    });
+  });
 
 // ── Keep-alive: free-tier Render sleeps after idle; a cold start during
 //    payment approval breaks the Pi flow ("developer failed to approve").

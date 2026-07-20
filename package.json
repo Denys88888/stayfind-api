@@ -9,6 +9,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "pg": "^8.22.0",
     "stellar-sdk": "^10.4.1"
   },
   "engines": {

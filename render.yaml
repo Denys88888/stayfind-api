@@ -7,5 +7,11 @@ services:
     envVars:
       - key: PI_SERVER_API_KEY
         sync: false  # Set manually in Render dashboard
+      - key: PI_WALLET_PRIVATE_SEED
+        sync: false  # App wallet seed for Pi refunds — from Pi Developer Portal
+      - key: DATABASE_URL
+        sync: false  # Optional: Postgres connection string. Without it,
+                      # bookings/listings are in-memory and lost on redeploy.
+                      # Set to a Render Postgres "Internal Database URL" to persist.
       - key: PORT
         value: 4000
