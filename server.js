@@ -565,11 +565,32 @@ app.post('/api/admin/settings', requireAdmin, async (req, res) => {
 // show up publicly once an admin approves them via /api/admin/listings —
 // unmoderated public listings on a payments-enabled site is a spam/abuse risk.
 
+// Geocode a free-text address/location via OpenStreetMap Nominatim (free,
+// no API key). Returns null on failure — callers must handle a missing
+// coordinate rather than silently defaulting to some other real city,
+// which would misrepresent where the property actually is.
+async function geocode(query) {
+  try {
+    const params = new URLSearchParams({ q: query, format: 'json', limit: '1' });
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+      headers: { 'User-Agent': 'StayFind/1.0 (Pi Network hotel booking app)' },
+    });
+    if (!res.ok) return null;
+    const results = await res.json();
+    if (!results.length) return null;
+    return [Number(results[0].lat), Number(results[0].lon)];
+  } catch {
+    return null;
+  }
+}
+
 app.post('/api/listings', async (req, res) => {
   const l = req.body || {};
   const required = ['ownerUid', 'name', 'location', 'address', 'price', 'description'];
   const missing = required.filter((k) => !l[k]);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  const coordinates = await geocode(`${l.address}, ${l.location}`) || await geocode(l.location);
 
   const listing = {
     id: Date.now() + Math.floor(Math.random() * 1000),
@@ -582,6 +603,7 @@ app.post('/api/listings', async (req, res) => {
     images: Array.isArray(l.images) && l.images.length ? l.images.slice(0, 8) : ['/hotel-1.jpg'],
     amenities: Array.isArray(l.amenities) ? l.amenities : [],
     propertyType: l.propertyType || 'Hotel',
+    coordinates,
     status: 'pending',
     createdAt: new Date().toISOString(),
   };
