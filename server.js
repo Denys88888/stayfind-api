@@ -633,6 +633,14 @@ app.get('/api/listings/:id', async (req, res) => {
 // A review can only be left once per booking, only by the guest who made it,
 // and only after the stay's checkout date has passed — no reviewing a stay
 // that hasn't happened yet, and no one but the actual guest can post one.
+// Must be registered before /api/reviews/:hotelId — otherwise Express would
+// match "summary" as a hotelId and this route would never be reached.
+app.get('/api/reviews/summary', async (req, res) => {
+  const hotelIds = String(req.query.hotelIds || '').split(',').filter(Boolean);
+  if (!hotelIds.length) return res.json({});
+  res.json(await store.getReviewSummaries(hotelIds));
+});
+
 app.get('/api/reviews/:hotelId', async (req, res) => {
   res.json(await store.getReviewsByHotel(req.params.hotelId));
 });

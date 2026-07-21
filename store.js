@@ -294,6 +294,37 @@ async function getReviewsByHotel(hotelId) {
   return memReviews.filter((r) => r.hotelId === hotelId);
 }
 
+// Batch rating summary for a list of hotel ids — used by search results so
+// listings show a real average rating without an N+1 request per card.
+async function getReviewSummaries(hotelIds) {
+  let rows;
+  if (pool) {
+    const result = await pool.query(
+      `SELECT hotel_id, data FROM reviews WHERE hotel_id = ANY($1)`,
+      [hotelIds.map(String)]
+    );
+    rows = result.rows.map((r) => r.data);
+  } else {
+    const idSet = new Set(hotelIds.map(String));
+    rows = memReviews.filter((r) => idSet.has(String(r.hotelId)));
+  }
+
+  const byHotel = {};
+  for (const r of rows) {
+    const key = String(r.hotelId);
+    if (!byHotel[key]) byHotel[key] = [];
+    byHotel[key].push(r.rating);
+  }
+  const summary = {};
+  for (const [hotelId, ratings] of Object.entries(byHotel)) {
+    summary[hotelId] = {
+      avgRating: Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10,
+      count: ratings.length,
+    };
+  }
+  return summary;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Settings (runtime-adjustable, no redeploy needed)                   */
 /* ------------------------------------------------------------------ */
@@ -339,6 +370,7 @@ module.exports = {
   createReview,
   getReviewByBooking,
   getReviewsByHotel,
+  getReviewSummaries,
   getSetting,
   setSetting,
 };
