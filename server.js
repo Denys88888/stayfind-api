@@ -565,20 +565,23 @@ app.post('/api/admin/settings', requireAdmin, async (req, res) => {
 // show up publicly once an admin approves them via /api/admin/listings —
 // unmoderated public listings on a payments-enabled site is a spam/abuse risk.
 
-// Geocode a free-text address/location via OpenStreetMap Nominatim (free,
-// no API key). Returns null on failure — callers must handle a missing
+// Geocode a free-text address/location via Photon (Komoot's free OSM-based
+// geocoder — no API key). Nominatim (OSMF's own instance) was tried first
+// but silently blocks/rejects requests from Render's shared egress IPs per
+// its strict usage policy; Photon runs on separate infrastructure and
+// doesn't. Returns null on failure — callers must handle a missing
 // coordinate rather than silently defaulting to some other real city,
 // which would misrepresent where the property actually is.
 async function geocode(query) {
   try {
-    const params = new URLSearchParams({ q: query, format: 'json', limit: '1' });
-    const res = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
-      headers: { 'User-Agent': 'StayFind/1.0 (Pi Network hotel booking app)' },
-    });
+    const params = new URLSearchParams({ q: query, limit: '1' });
+    const res = await fetch(`https://photon.komoot.io/api/?${params}`);
     if (!res.ok) return null;
-    const results = await res.json();
-    if (!results.length) return null;
-    return [Number(results[0].lat), Number(results[0].lon)];
+    const data = await res.json();
+    const feature = data.features && data.features[0];
+    if (!feature) return null;
+    const [lon, lat] = feature.geometry.coordinates;
+    return [Number(lat), Number(lon)];
   } catch {
     return null;
   }
