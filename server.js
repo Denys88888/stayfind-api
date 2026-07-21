@@ -152,6 +152,21 @@ app.post('/api/payments/complete/:paymentId', async (req, res) => {
   }
 });
 
+function datesOverlapRange(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+// A host can block their own listing's dates (renovation, booked elsewhere,
+// etc). True whenever [checkIn, checkOut) overlaps any blocked range.
+function isBlockedByHost(listing, checkIn, checkOut) {
+  if (!listing || !Array.isArray(listing.blockedRanges)) return false;
+  const inStart = new Date(checkIn).getTime();
+  const inEnd = new Date(checkOut).getTime();
+  return listing.blockedRanges.some((r) =>
+    datesOverlapRange(inStart, inEnd, new Date(r.checkIn).getTime(), new Date(r.checkOut).getTime())
+  );
+}
+
 // ── Bookings: availability check ────────────────────────────────────────────
 app.get('/api/bookings/availability', async (req, res) => {
   const { hotelId, roomType, checkIn, checkOut } = req.query;
@@ -159,7 +174,13 @@ app.get('/api/bookings/availability', async (req, res) => {
     return res.status(400).json({ error: 'hotelId, roomType, checkIn, checkOut required' });
   }
   const conflict = await store.findBookingConflict({ hotelId, roomType, checkIn, checkOut });
-  res.json({ available: !conflict });
+  if (conflict) return res.json({ available: false });
+
+  const listing = await store.getListingById(hotelId).catch(() => null);
+  if (isBlockedByHost(listing, checkIn, checkOut)) {
+    return res.json({ available: false, reason: 'blocked_by_host' });
+  }
+  res.json({ available: true });
 });
 
 // ── Bookings: real-payment eligibility ──────────────────────────────────────
@@ -185,13 +206,36 @@ app.post('/api/bookings', async (req, res) => {
   const missing = required.filter((k) => !b[k]);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
 
+  const isRealPaymentEarly = b.txid && !String(b.txid).startsWith('demo_');
+  const listing = await store.getListingById(b.hotelId).catch(() => null);
   const conflict = await store.findBookingConflict(b);
-  if (conflict) {
-    return res.status(409).json({ error: 'Room already booked for these dates', conflictId: conflict.id });
+  const blocked = isBlockedByHost(listing, b.checkIn, b.checkOut);
+
+  // Same principle as the demo-hotel check below: the pre-payment gate is
+  // GET /api/bookings/availability, called by the frontend before the Pi
+  // payment is initiated. If a conflict/block still slips through (e.g. a
+  // race between two guests paying at nearly the same moment, or the host
+  // blocking dates after the guest already started paying), rejecting here
+  // would leave a guest who already paid with neither a room nor their Pi
+  // back. Only hard-reject when no real payment is on the line yet (demo
+  // mode) — otherwise flag it for admin follow-up.
+  if (conflict || blocked) {
+    if (!isRealPaymentEarly) {
+      return res.status(409).json({
+        error: blocked ? 'These dates are blocked by the host' : 'Room already booked for these dates',
+        conflictId: conflict?.id,
+      });
+    }
+    console.warn(`[Booking] ${b.id}: ${blocked ? 'host-blocked dates' : `conflict with ${conflict.id}`} on a real payment — needs admin review`);
   }
 
-  const booking = { ...b, status: b.status || 'confirmed', createdAt: new Date().toISOString() };
-  const listing = await store.getListingById(b.hotelId).catch(() => null);
+  const booking = {
+    ...b,
+    status: b.status || 'confirmed',
+    createdAt: new Date().toISOString(),
+    ...(conflict ? { flaggedDoubleBooked: true, conflictBookingId: conflict.id } : {}),
+    ...(blocked ? { flaggedHostBlockedDates: true } : {}),
+  };
 
   // Defense-in-depth only: the real gate is GET /api/bookings/real-payment-
   // eligibility, called by the frontend BEFORE the Pi payment is initiated.
@@ -199,8 +243,7 @@ app.post('/api/bookings', async (req, res) => {
   // wallet — rejecting the booking now would leave them with nothing to
   // show for it. Instead, flag it so an admin notices and can refund/follow
   // up, rather than silently keeping money for a demo hotel with no host.
-  const isRealPayment = b.txid && !String(b.txid).startsWith('demo_');
-  if (isRealPayment && !listing) {
+  if (isRealPaymentEarly && !listing) {
     const allowDemoBookings = await store.getSetting('allowDemoBookings', false);
     if (!allowDemoBookings) {
       booking.flaggedDemoRealPayment = true;
@@ -406,7 +449,7 @@ app.get('/api/admin/payouts', requireAdmin, async (_req, res) => {
 
 app.get('/api/admin/flagged-bookings', requireAdmin, async (_req, res) => {
   const all = await store.getAllBookings();
-  res.json(all.filter((b) => b.flaggedDemoRealPayment));
+  res.json(all.filter((b) => b.flaggedDemoRealPayment || b.flaggedDoubleBooked || b.flaggedHostBlockedDates));
 });
 
 app.post('/api/admin/bookings/:id/release-payout', requireAdmin, async (req, res) => {
@@ -627,6 +670,37 @@ app.get('/api/listings/:id', async (req, res) => {
   const listing = await store.getListingById(req.params.id);
   if (!listing || listing.status !== 'approved') return res.status(404).json({ error: 'Not found' });
   res.json(listing);
+});
+
+// ── Listings: host-managed blocked date ranges ──────────────────────────────
+// Lets a host mark dates unavailable (renovation, booked elsewhere, etc.)
+// independent of guest bookings. Checked by both the availability endpoint
+// (pre-payment) and booking creation (defense-in-depth).
+app.post('/api/listings/:id/block-dates', async (req, res) => {
+  const { piUid, checkIn, checkOut } = req.body || {};
+  if (!piUid || !checkIn || !checkOut) return res.status(400).json({ error: 'piUid, checkIn, checkOut required' });
+
+  const listing = await store.getListingById(req.params.id);
+  if (!listing) return res.status(404).json({ error: 'Not found' });
+  if (listing.ownerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (new Date(checkIn) >= new Date(checkOut)) return res.status(400).json({ error: 'checkOut must be after checkIn' });
+
+  const blockedRanges = [...(listing.blockedRanges || []), { checkIn, checkOut }];
+  const updated = await store.updateListing(req.params.id, { blockedRanges });
+  res.json(updated);
+});
+
+app.post('/api/listings/:id/unblock-dates', async (req, res) => {
+  const { piUid, index } = req.body || {};
+  if (!piUid || index == null) return res.status(400).json({ error: 'piUid, index required' });
+
+  const listing = await store.getListingById(req.params.id);
+  if (!listing) return res.status(404).json({ error: 'Not found' });
+  if (listing.ownerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+
+  const blockedRanges = (listing.blockedRanges || []).filter((_, i) => i !== Number(index));
+  const updated = await store.updateListing(req.params.id, { blockedRanges });
+  res.json(updated);
 });
 
 // ── Reviews ──────────────────────────────────────────────────────────────────
