@@ -67,6 +67,13 @@ async function init() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reviews_hotel_id ON reviews(hotel_id);`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL
+    );
+  `);
+
   console.log('[Store] Postgres connected, tables ready');
 }
 
@@ -76,6 +83,7 @@ async function init() {
 const memBookings = [];
 const memListings = [];
 const memReviews = [];
+const memSettings = {};
 
 function datesOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
@@ -286,6 +294,31 @@ async function getReviewsByHotel(hotelId) {
   return memReviews.filter((r) => r.hotelId === hotelId);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Settings (runtime-adjustable, no redeploy needed)                   */
+/* ------------------------------------------------------------------ */
+
+async function getSetting(key, defaultValue) {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT value FROM settings WHERE key = $1`, [key]);
+    return rows[0] ? rows[0].value : defaultValue;
+  }
+  return key in memSettings ? memSettings[key] : defaultValue;
+}
+
+async function setSetting(key, value) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = $2`,
+      [key, value]
+    );
+    return value;
+  }
+  memSettings[key] = value;
+  return value;
+}
+
 module.exports = {
   isEnabled,
   init,
@@ -306,4 +339,6 @@ module.exports = {
   createReview,
   getReviewByBooking,
   getReviewsByHotel,
+  getSetting,
+  setSetting,
 };

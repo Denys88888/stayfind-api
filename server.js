@@ -162,6 +162,22 @@ app.get('/api/bookings/availability', async (req, res) => {
   res.json({ available: !conflict });
 });
 
+// ── Bookings: real-payment eligibility ──────────────────────────────────────
+// Call BEFORE initiating a real Pi payment. The static demo catalog has no
+// real host and delivers no real service — a real Pi payment there takes
+// money with nothing behind it. Checked pre-payment, not post-payment: once
+// the guest has actually paid, it's too late to just reject the booking.
+app.get('/api/bookings/real-payment-eligibility', async (req, res) => {
+  const { hotelId } = req.query;
+  const listing = await store.getListingById(hotelId).catch(() => null);
+  if (listing) return res.json({ allowed: true });
+  const allowDemoBookings = await store.getSetting('allowDemoBookings', false);
+  res.json({
+    allowed: !!allowDemoBookings,
+    reason: allowDemoBookings ? undefined : 'This property is a demo listing and cannot be booked with a real Pi payment.',
+  });
+});
+
 // ── Bookings: create ─────────────────────────────────────────────────────────
 app.post('/api/bookings', async (req, res) => {
   const b = req.body || {};
@@ -175,12 +191,27 @@ app.post('/api/bookings', async (req, res) => {
   }
 
   const booking = { ...b, status: b.status || 'confirmed', createdAt: new Date().toISOString() };
+  const listing = await store.getListingById(b.hotelId).catch(() => null);
+
+  // Defense-in-depth only: the real gate is GET /api/bookings/real-payment-
+  // eligibility, called by the frontend BEFORE the Pi payment is initiated.
+  // By the time this endpoint runs, the guest's Pi has already left their
+  // wallet — rejecting the booking now would leave them with nothing to
+  // show for it. Instead, flag it so an admin notices and can refund/follow
+  // up, rather than silently keeping money for a demo hotel with no host.
+  const isRealPayment = b.txid && !String(b.txid).startsWith('demo_');
+  if (isRealPayment && !listing) {
+    const allowDemoBookings = await store.getSetting('allowDemoBookings', false);
+    if (!allowDemoBookings) {
+      booking.flaggedDemoRealPayment = true;
+      console.warn(`[Booking] ${booking.id}: real Pi payment on demo hotel ${b.hotelId} — needs admin review`);
+    }
+  }
 
   // Escrow: if this booking is on a user-submitted listing, hold the guest's
   // payment and schedule a payout (minus platform commission) to the host,
   // released once the stay's checkout date passes. Static demo hotels have
   // no real host, so they're skipped — full amount is platform revenue as before.
-  const listing = await store.getListingById(b.hotelId).catch(() => null);
   if (listing && listing.ownerUid && listing.ownerUid !== b.piUid && b.totalPi) {
     booking.hostUid = listing.ownerUid;
     booking.platformFeeRate = PLATFORM_COMMISSION_RATE;
@@ -373,6 +404,11 @@ app.get('/api/admin/payouts', requireAdmin, async (_req, res) => {
   res.json(all.filter((b) => b.hostUid));
 });
 
+app.get('/api/admin/flagged-bookings', requireAdmin, async (_req, res) => {
+  const all = await store.getAllBookings();
+  res.json(all.filter((b) => b.flaggedDemoRealPayment));
+});
+
 app.post('/api/admin/bookings/:id/release-payout', requireAdmin, async (req, res) => {
   const booking = await store.getBookingById(req.params.id);
   if (!booking) return res.status(404).json({ error: 'Booking not found' });
@@ -504,6 +540,23 @@ app.get('/api/admin/config', requireAdmin, (_req, res) => {
     ],
     nodeVersion: process.version,
     uptime: Math.floor(process.uptime()),
+  });
+});
+
+// ── Admin: runtime settings (no redeploy needed) ────────────────────────────
+app.get('/api/admin/settings', requireAdmin, async (_req, res) => {
+  res.json({
+    allowDemoBookings: await store.getSetting('allowDemoBookings', false),
+  });
+});
+
+app.post('/api/admin/settings', requireAdmin, async (req, res) => {
+  const { allowDemoBookings } = req.body || {};
+  if (typeof allowDemoBookings === 'boolean') {
+    await store.setSetting('allowDemoBookings', allowDemoBookings);
+  }
+  res.json({
+    allowDemoBookings: await store.getSetting('allowDemoBookings', false),
   });
 });
 
