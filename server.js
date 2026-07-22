@@ -64,8 +64,8 @@ app.get('/health', (_req, res) => {
 });
 
 // ── Public config (no admin key needed — safe, non-sensitive values) ───────
-app.get('/api/config', (_req, res) => {
-  res.json({ platformCommissionRate: PLATFORM_COMMISSION_RATE });
+app.get('/api/config', async (_req, res) => {
+  res.json({ platformCommissionRate: await getPlatformCommissionRate() });
 });
 
 // ── Payments: approve ──────────────────────────────────────────────────────
@@ -256,9 +256,10 @@ app.post('/api/bookings', async (req, res) => {
   // released once the stay's checkout date passes. Static demo hotels have
   // no real host, so they're skipped — full amount is platform revenue as before.
   if (listing && listing.ownerUid && listing.ownerUid !== b.piUid && b.totalPi) {
+    const commissionRate = await getPlatformCommissionRate();
     booking.hostUid = listing.ownerUid;
-    booking.platformFeeRate = PLATFORM_COMMISSION_RATE;
-    booking.platformFeeAmount = Math.round(b.totalPi * PLATFORM_COMMISSION_RATE * 100) / 100;
+    booking.platformFeeRate = commissionRate;
+    booking.platformFeeAmount = Math.round(b.totalPi * commissionRate * 100) / 100;
     booking.hostPayoutAmount = Math.round((b.totalPi - booking.platformFeeAmount) * 100) / 100;
     booking.hostPayoutStatus = 'held';
   }
@@ -369,7 +370,15 @@ async function issueRefund(booking) {
 // checkout date passes (escrow), then pays the host their share minus the
 // platform commission. Only applies to bookings on user-submitted listings —
 // the static demo catalog has no real host to pay.
-const PLATFORM_COMMISSION_RATE = Number(process.env.PLATFORM_COMMISSION_RATE || '0.08');
+//
+// The rate is runtime-adjustable via the settings store (admin panel, no
+// redeploy needed) — the env var is only the default before an admin ever
+// sets one explicitly.
+const DEFAULT_PLATFORM_COMMISSION_RATE = Number(process.env.PLATFORM_COMMISSION_RATE || '0.08');
+
+async function getPlatformCommissionRate() {
+  return await store.getSetting('platformCommissionRate', DEFAULT_PLATFORM_COMMISSION_RATE);
+}
 
 async function issueHostPayout(booking) {
   try {
@@ -571,11 +580,11 @@ app.post('/api/admin/payments/:paymentId/cancel', requireAdmin, async (req, res)
 });
 
 // ── Admin: config ──────────────────────────────────────────────────────────
-app.get('/api/admin/config', requireAdmin, (_req, res) => {
+app.get('/api/admin/config', requireAdmin, async (_req, res) => {
   res.json({
     mode: PI_SERVER_API_KEY ? 'REAL' : 'MOCK',
     piApiBase: 'https://api.minepi.com',
-    platformCommissionRate: PLATFORM_COMMISSION_RATE,
+    platformCommissionRate: await getPlatformCommissionRate(),
     corsOrigins: [
       'https://stayfind-pi-booking.onrender.com',
       'http://localhost:5173',
@@ -590,16 +599,24 @@ app.get('/api/admin/config', requireAdmin, (_req, res) => {
 app.get('/api/admin/settings', requireAdmin, async (_req, res) => {
   res.json({
     allowDemoBookings: await store.getSetting('allowDemoBookings', false),
+    platformCommissionRate: await getPlatformCommissionRate(),
   });
 });
 
 app.post('/api/admin/settings', requireAdmin, async (req, res) => {
-  const { allowDemoBookings } = req.body || {};
+  const { allowDemoBookings, platformCommissionRate } = req.body || {};
   if (typeof allowDemoBookings === 'boolean') {
     await store.setSetting('allowDemoBookings', allowDemoBookings);
   }
+  if (typeof platformCommissionRate === 'number') {
+    if (platformCommissionRate < 0 || platformCommissionRate > 0.5) {
+      return res.status(400).json({ error: 'platformCommissionRate must be between 0 and 0.5' });
+    }
+    await store.setSetting('platformCommissionRate', platformCommissionRate);
+  }
   res.json({
     allowDemoBookings: await store.getSetting('allowDemoBookings', false),
+    platformCommissionRate: await getPlatformCommissionRate(),
   });
 });
 
@@ -788,7 +805,7 @@ store.init()
         console.warn('PI_SERVER_API_KEY not set — running in mock mode');
       }
       console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
-      console.log(`Platform commission: ${(PLATFORM_COMMISSION_RATE * 100).toFixed(1)}%`);
+      console.log(`Platform commission (default, overridable in /admin): ${(DEFAULT_PLATFORM_COMMISSION_RATE * 100).toFixed(1)}%`);
       releaseDuePayouts().catch((err) => console.error('[Payout] initial scan failed:', err));
     });
   });
