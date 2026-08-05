@@ -283,6 +283,25 @@ async function getReviewByBooking(bookingId) {
   return memReviews.find((r) => r.bookingId === bookingId) || null;
 }
 
+async function getAllReviews() {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT data FROM reviews ORDER BY created_at DESC LIMIT 200`);
+    return rows.map((r) => r.data);
+  }
+  return memReviews.slice(0, 200);
+}
+
+async function deleteReview(id) {
+  if (pool) {
+    const { rowCount } = await pool.query(`DELETE FROM reviews WHERE id = $1`, [id]);
+    return rowCount > 0;
+  }
+  const idx = memReviews.findIndex((r) => r.id === id);
+  if (idx === -1) return false;
+  memReviews.splice(idx, 1);
+  return true;
+}
+
 async function getReviewsByHotel(hotelId) {
   if (pool) {
     const { rows } = await pool.query(
@@ -371,6 +390,8 @@ module.exports = {
   getReviewByBooking,
   getReviewsByHotel,
   getReviewSummaries,
+  getAllReviews,
+  deleteReview,
   getSetting,
   setSetting,
 };

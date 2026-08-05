@@ -771,6 +771,17 @@ app.post('/api/reviews', async (req, res) => {
   res.json(review);
 });
 
+// ── Admin: review moderation ────────────────────────────────────────────────
+app.get('/api/admin/reviews', requireAdmin, async (_req, res) => {
+  res.json(await store.getAllReviews());
+});
+
+app.delete('/api/admin/reviews/:id', requireAdmin, async (req, res) => {
+  const deleted = await store.deleteReview(req.params.id);
+  if (!deleted) return res.status(404).json({ error: 'Not found' });
+  res.json({ ok: true });
+});
+
 // Admin: moderation queue
 app.get('/api/admin/listings', requireAdmin, async (req, res) => {
   const { status } = req.query;
