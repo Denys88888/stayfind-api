@@ -147,7 +147,7 @@ app.get('/api/config', async (_req, res) => {
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    persistentStorage: !!store.isEnabled,
+    persistentStorage: store.isPersistent(),
     piPaymentsConfigured: !!PI_SERVER_API_KEY,
     payoutsConfigured: !!PI_WALLET_PRIVATE_SEED,
     uptimeSeconds: Math.floor(process.uptime()),
@@ -308,11 +308,27 @@ app.get('/api/bookings/availability', async (req, res) => {
 // the guest has actually paid, it's too late to just reject the booking.
 app.get('/api/bookings/real-payment-eligibility', async (req, res) => {
   const { hotelId } = req.query;
+
+  // Refuse to take money this deployment cannot honour. Without a database the
+  // record of who paid what is erased on the next restart; without a wallet
+  // seed the host can never be paid and the guest can never be refunded.
+  // Taking real Pi in that state strands somebody else's money. Self-healing:
+  // set DATABASE_URL and PI_WALLET_PRIVATE_SEED and payments resume with no
+  // code change.
+  if (!store.isPersistent() || !PI_WALLET_PRIVATE_SEED) {
+    return res.json({
+      allowed: false,
+      code: 'not_configured',
+      reason: 'Real Pi payments are temporarily unavailable while this service is being set up.',
+    });
+  }
+
   const listing = await store.getListingById(hotelId).catch(() => null);
   if (listing) return res.json({ allowed: true });
   const allowDemoBookings = await store.getSetting('allowDemoBookings', false);
   res.json({
     allowed: !!allowDemoBookings,
+    code: allowDemoBookings ? undefined : 'demo_listing',
     reason: allowDemoBookings ? undefined : 'This property is a demo listing and cannot be booked with a real Pi payment.',
   });
 });
@@ -799,7 +815,7 @@ app.get('/api/admin/stats', requireAdmin, (_req, res) => {
   res.json({
     mode: PI_SERVER_API_KEY ? 'REAL' : 'MOCK',
     sandbox: !PI_SERVER_API_KEY,
-    storage: store.isEnabled ? 'POSTGRES' : 'IN_MEMORY',
+    storage: store.isPersistent() ? 'POSTGRES' : 'IN_MEMORY',
     uptime: Math.floor(process.uptime()),
     total: payments.length,
     todayTotal: todayPayments.length,
@@ -1137,7 +1153,7 @@ app.post('/api/admin/listings/:id/reject', requireAdmin, async (req, res) => {
 
 store.init()
   .then(() => {
-    if (!store.isEnabled) {
+    if (!store.isPersistent()) {
       console.warn('DATABASE_URL not set — bookings/listings are in-memory and will be lost on redeploy');
     }
   })
@@ -1152,6 +1168,9 @@ store.init()
       }
       console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
       console.log(`Platform commission (default, overridable in /admin): ${(DEFAULT_PLATFORM_COMMISSION_RATE * 100).toFixed(1)}%`);
+      if (!store.isPersistent() || !PI_WALLET_PRIVATE_SEED) {
+        console.warn('REAL Pi PAYMENTS ARE REFUSED: needs a working DATABASE_URL and PI_WALLET_PRIVATE_SEED');
+      }
       releaseDuePayouts().catch((err) => console.error('[Payout] initial scan failed:', err));
     });
   });

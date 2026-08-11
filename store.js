@@ -25,8 +25,26 @@ if (isEnabled) {
   });
 }
 
+/** True only when Postgres is actually usable — not merely configured. */
+function isPersistent() {
+  return !!pool;
+}
+
 async function init() {
   if (!pool) return;
+  try {
+    await initSchema();
+  } catch (err) {
+    // Keeping a half-connected pool is worse than having none: every query
+    // would throw, and callers that ask whether storage is durable would be
+    // told yes. Drop it so the in-memory fallback is real and isPersistent()
+    // tells the truth.
+    pool = null;
+    throw err;
+  }
+}
+
+async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bookings (
       id TEXT PRIMARY KEY,
@@ -454,6 +472,7 @@ async function setSetting(key, value) {
 
 module.exports = {
   isEnabled,
+  isPersistent,
   init,
   findBookingConflict,
   createBooking,
