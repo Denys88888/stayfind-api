@@ -408,6 +408,9 @@ app.post('/api/bookings', async (req, res) => {
     }
   }
 
+  const parsedTotalPi = Number(b.totalPi);
+  const claimedTotalPi = Number.isFinite(parsedTotalPi) && parsedTotalPi > 0 ? parsedTotalPi : undefined;
+
   // Whitelist what a client may set. Spreading the raw body would let a caller
   // hand themselves payout/refund fields (hostPayoutAmount, refundStatus, …)
   // that decide how much Pi leaves the app wallet.
@@ -424,7 +427,10 @@ app.post('/api/bookings', async (req, res) => {
     nights: b.nights,
     guests: b.guests,
     totalUsd: b.totalUsd,
-    totalPi: verifiedAmount ?? b.totalPi,
+    // Coerced to a real number here: totalPi feeds the payout/refund maths,
+    // and a string or NaN slipping through would throw deep inside those
+    // rather than being rejected at the edge.
+    totalPi: verifiedAmount ?? claimedTotalPi,
     txid: b.txid,
     paymentId: b.paymentId,
     bookedAt: b.bookedAt,
@@ -468,7 +474,14 @@ app.post('/api/bookings', async (req, res) => {
     booking.hostPayoutStatus = 'held';
   }
 
-  await store.createBooking(booking);
+  try {
+    await store.createBooking(booking);
+  } catch (err) {
+    if (err instanceof store.DuplicatePaymentError) {
+      return res.status(409).json({ error: 'This payment has already been used for another booking' });
+    }
+    throw err;
+  }
   res.json(booking);
 });
 
@@ -487,6 +500,17 @@ app.get('/api/bookings/host/:hostUid', requirePiIdentity('hostUid'), async (req,
 // Per Pi Platform docs, A2U payments are created via the Platform API (server
 // key) then signed and submitted to the Pi blockchain (a Stellar fork) using
 // the app wallet's own private seed, then marked complete via the Platform API.
+// Raised when the transfer succeeded on-chain but Pi's Platform API could not
+// be told about it. Carries the txid so the booking can record that the money
+// really did go out — retrying such a payment would send it a second time.
+class A2USentButUnconfirmed extends Error {
+  constructor(txid, detail) {
+    super(`sent on-chain (txid ${txid}) but Platform API completion failed: ${detail}`);
+    this.name = 'A2USentButUnconfirmed';
+    this.txid = txid;
+  }
+}
+
 async function sendA2UPayment({ uid, amount, memo, metadata }) {
   if (!PI_SERVER_API_KEY || !PI_WALLET_PRIVATE_SEED) {
     throw new Error('PI_SERVER_API_KEY / PI_WALLET_PRIVATE_SEED not configured — payment must be sent manually');
@@ -536,7 +560,10 @@ async function sendA2UPayment({ uid, amount, memo, metadata }) {
     headers: { Authorization: `Key ${PI_SERVER_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ txid }),
   });
-  if (!completeRes.ok) throw new Error(`complete failed: ${await completeRes.text()}`);
+  // The Pi is already on-chain at this point. A failure here means only that
+  // Pi's records are out of step — the money HAS left the wallet, so this must
+  // never be reported as a plain failure that someone would retry.
+  if (!completeRes.ok) throw new A2USentButUnconfirmed(txid, await completeRes.text());
 
   return txid;
 }
@@ -559,6 +586,15 @@ async function issueRefund(booking) {
     });
     console.log(`[Refund] ${booking.id}: sent ${booking.totalPi} π, txid ${txid}`);
   } catch (err) {
+    if (err instanceof A2USentButUnconfirmed) {
+      await store.updateBooking(booking.id, {
+        refundStatus: 'sent_unconfirmed',
+        refundTxid: err.txid,
+        refundNote: String(err),
+      });
+      console.error(`[Refund] ${booking.id}: PI ALREADY SENT (txid ${err.txid}) — do not retry`, err);
+      return;
+    }
     const status = /not configured/.test(String(err)) ? 'pending_manual' : 'failed';
     await store.updateBooking(booking.id, { refundStatus: status, refundNote: String(err) });
     if (status === 'pending_manual') {
@@ -599,6 +635,15 @@ async function issueHostPayout(booking) {
     });
     console.log(`[Payout] ${booking.id}: sent ${booking.hostPayoutAmount} π to host ${booking.hostUid}, txid ${txid}`);
   } catch (err) {
+    if (err instanceof A2USentButUnconfirmed) {
+      await store.updateBooking(booking.id, {
+        hostPayoutStatus: 'sent_unconfirmed',
+        hostPayoutTxid: err.txid,
+        hostPayoutNote: String(err),
+      });
+      console.error(`[Payout] ${booking.id}: PI ALREADY SENT (txid ${err.txid}) — do not retry`, err);
+      return;
+    }
     const status = /not configured/.test(String(err)) ? 'pending_manual' : 'failed';
     await store.updateBooking(booking.id, { hostPayoutStatus: status, hostPayoutNote: String(err) });
     if (status === 'pending_manual') {
@@ -630,33 +675,45 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
 
   const alreadyCancelled = existing.status === 'cancelled';
   const isRealPayment = existing.txid && !String(existing.txid).startsWith('demo_');
+
+  // The guest's money may have already been forwarded to the host. Refunding
+  // on top of that pays the same booking out twice, so those are settled by
+  // hand. Only an escrow still sitting untouched ('held') can be called off.
+  const payoutAlreadyGone = existing.hostUid && existing.hostPayoutStatus !== 'held';
+  const shouldCancelPayout = !alreadyCancelled && existing.hostUid && existing.hostPayoutStatus === 'held';
+
   // A refund sends real Pi out of the app wallet using the booking's stored
   // totalPi. If that amount was never confirmed against the actual Pi payment,
   // refunding it would pay out money the platform may never have received —
   // an admin settles those by hand instead.
-  const shouldRefund =
+  const refundAllowed =
     !alreadyCancelled &&
     isRealPayment &&
     existing.totalPi &&
-    !existing.refundStatus &&
-    !existing.flaggedUnverifiedPayment;
+    !existing.flaggedUnverifiedPayment &&
+    !payoutAlreadyGone;
 
-  if (!alreadyCancelled && isRealPayment && existing.flaggedUnverifiedPayment) {
-    console.warn(`[Refund] ${id}: withheld — payment was never verified (${existing.flaggedUnverifiedPayment})`);
+  if (!alreadyCancelled && isRealPayment && !refundAllowed) {
+    const reason = existing.flaggedUnverifiedPayment
+      ? `payment was never verified (${existing.flaggedUnverifiedPayment})`
+      : payoutAlreadyGone
+        ? `host payout is '${existing.hostPayoutStatus}'`
+        : 'no refundable amount';
+    console.warn(`[Refund] ${id}: withheld — ${reason}`);
   }
-  // If a host payout was held in escrow and hasn't gone out yet, cancelling
-  // the booking cancels the payout too — the guest is getting refunded instead.
-  const shouldCancelPayout = !alreadyCancelled && existing.hostUid && existing.hostPayoutStatus === 'held';
+
+  // Claim the refund before anything else: this is what stops two concurrent
+  // cancellations from each sending the guest their money.
+  const claimed = refundAllowed ? await store.claimRefund(id) : null;
 
   const booking = await store.updateBooking(id, {
     status: 'cancelled',
     cancelledAt: new Date().toISOString(),
-    ...(shouldRefund ? { refundStatus: 'processing' } : {}),
     ...(shouldCancelPayout ? { hostPayoutStatus: 'cancelled' } : {}),
+    ...(!refundAllowed && !alreadyCancelled && isRealPayment ? { refundNeedsReview: true } : {}),
   });
 
-  // Only refund real Pi payments (skip demo/mock txids) and only once.
-  if (shouldRefund) {
+  if (claimed) {
     issueRefund(booking); // fire-and-forget — cancellation itself must not block on this
   }
 
@@ -666,7 +723,15 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
 // ── Admin: refunds / payouts needing manual processing ─────────────────────
 app.get('/api/admin/refunds', requireAdmin, async (_req, res) => {
   const all = await store.getAllBookings();
-  res.json(all.filter((b) => b.refundStatus === 'pending_manual' || b.refundStatus === 'failed'));
+  res.json(all.filter((b) =>
+    b.refundStatus === 'pending_manual' ||
+    b.refundStatus === 'failed' ||
+    // Sent on-chain but Pi's records disagree — needs reconciling, never a retry.
+    b.refundStatus === 'sent_unconfirmed' ||
+    // Cancelled but not auto-refundable (unverified payment, or the host was
+    // already paid) — a human decides what the guest is owed.
+    b.refundNeedsReview
+  ));
 });
 
 app.get('/api/admin/payouts', requireAdmin, async (_req, res) => {
@@ -676,14 +741,27 @@ app.get('/api/admin/payouts', requireAdmin, async (_req, res) => {
 
 app.get('/api/admin/flagged-bookings', requireAdmin, async (_req, res) => {
   const all = await store.getAllBookings();
-  res.json(all.filter((b) => b.flaggedDemoRealPayment || b.flaggedDoubleBooked || b.flaggedHostBlockedDates));
+  res.json(all.filter((b) =>
+    b.flaggedDemoRealPayment ||
+    b.flaggedDoubleBooked ||
+    b.flaggedHostBlockedDates ||
+    // Withheld payouts/refunds land here — this queue is the only place they
+    // surface for a human to settle, so it must include them.
+    b.flaggedUnverifiedPayment
+  ));
 });
 
 app.post('/api/admin/bookings/:id/release-payout', requireAdmin, async (req, res) => {
   const booking = await store.getBookingById(req.params.id);
   if (!booking) return res.status(404).json({ error: 'Booking not found' });
   if (!booking.hostUid) return res.status(400).json({ error: 'Booking has no host payout' });
-  if (booking.hostPayoutStatus === 'completed') return res.status(400).json({ error: 'Already paid out' });
+  // 'sent_unconfirmed' means the Pi already left the wallet on-chain even
+  // though Pi's records disagree — releasing again would pay twice.
+  // 'processing' means a release is in flight right now.
+  const notRetryable = ['completed', 'sent_unconfirmed', 'processing', 'cancelled'];
+  if (notRetryable.includes(booking.hostPayoutStatus)) {
+    return res.status(400).json({ error: `Payout is '${booking.hostPayoutStatus}' — not retryable` });
+  }
 
   await store.updateBooking(booking.id, { hostPayoutStatus: 'processing' });
   await issueHostPayout(booking);

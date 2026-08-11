@@ -42,6 +42,13 @@ async function init() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_pi_uid ON bookings(pi_uid);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_bookings_hotel_room ON bookings(hotel_id, room_type);`);
+  // One Pi payment funds at most one booking. Enforced by the database rather
+  // than by a read-then-write check, which two concurrent requests can both
+  // pass. Partial so the many bookings without a paymentId aren't constrained.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_payment_id
+    ON bookings ((data->>'paymentId')) WHERE data->>'paymentId' IS NOT NULL;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS listings (
@@ -116,7 +123,42 @@ async function findBookingConflict({ hotelId, roomType, checkIn, checkOut }, exc
   ) || null;
 }
 
+/** Raised when a Pi payment has already funded a booking. */
+class DuplicatePaymentError extends Error {
+  constructor(paymentId) {
+    super(`payment ${paymentId} already funded a booking`);
+    this.name = 'DuplicatePaymentError';
+    this.paymentId = paymentId;
+  }
+}
+
 async function createBooking(booking) {
+  // The caller checks for a duplicate payment first, but awaits a network
+  // round-trip to Pi in between — two requests carrying the same paymentId can
+  // both pass that check. This is the last, gap-free point to catch it: the
+  // unique index does it for Postgres, and the in-memory scan below runs
+  // synchronously right before the insert, with no await to interleave on.
+  if (booking.paymentId) {
+    if (pool) {
+      try {
+        await pool.query(
+          `INSERT INTO bookings (id, pi_uid, hotel_id, room_type, check_in, check_out, status, data)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [booking.id, booking.piUid, booking.hotelId, booking.roomType, booking.checkIn, booking.checkOut, booking.status, booking]
+        );
+        return booking;
+      } catch (err) {
+        if (err.code === '23505' && String(err.constraint || '').includes('payment')) {
+          throw new DuplicatePaymentError(booking.paymentId);
+        }
+        throw err;
+      }
+    }
+    if (memBookings.some((x) => x.paymentId === booking.paymentId)) {
+      throw new DuplicatePaymentError(booking.paymentId);
+    }
+  }
+
   if (pool) {
     await pool.query(
       `INSERT INTO bookings (id, pi_uid, hotel_id, room_type, check_in, check_out, status, data)
@@ -179,6 +221,33 @@ async function getAllBookings() {
     return rows.map((r) => r.data);
   }
   return memBookings;
+}
+
+/**
+ * Atomically claim the right to refund a booking.
+ *
+ * Returns the updated booking if this caller won the claim, or null if a
+ * refund was already claimed. A read-then-write in the route can't do this:
+ * two concurrent cancellations both read "no refund yet" across the await and
+ * both send the guest their money.
+ */
+async function claimRefund(id) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `UPDATE bookings
+          SET data = jsonb_set(data, '{refundStatus}', '"processing"')
+        WHERE id = $1 AND data->>'refundStatus' IS NULL
+        RETURNING data`,
+      [id]
+    );
+    return rows[0]?.data || null;
+  }
+  // Single-threaded and await-free: nothing can interleave between the check
+  // and the assignment.
+  const booking = memBookings.find((x) => x.id === id);
+  if (!booking || booking.refundStatus) return null;
+  booking.refundStatus = 'processing';
+  return booking;
 }
 
 async function getBookingsDueForPayout() {
@@ -391,6 +460,8 @@ module.exports = {
   getBookingsByOwner,
   getBookingById,
   getBookingByPaymentId,
+  DuplicatePaymentError,
+  claimRefund,
   getBookingsByHost,
   getAllBookings,
   getBookingsDueForPayout,
