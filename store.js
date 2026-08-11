@@ -148,6 +148,20 @@ async function getBookingById(id) {
   return memBookings.find((b) => b.id === id) || null;
 }
 
+// Replay guard: one Pi payment may fund exactly one booking. Without this,
+// the same completed payment could be submitted repeatedly to create several
+// bookings, each arming its own payout out of the app wallet.
+async function getBookingByPaymentId(paymentId) {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT data FROM bookings WHERE data->>'paymentId' = $1 LIMIT 1`,
+      [paymentId]
+    );
+    return rows[0]?.data || null;
+  }
+  return memBookings.find((b) => b.paymentId === paymentId) || null;
+}
+
 async function getBookingsByHost(hostUid) {
   if (pool) {
     const { rows } = await pool.query(
@@ -376,6 +390,7 @@ module.exports = {
   createBooking,
   getBookingsByOwner,
   getBookingById,
+  getBookingByPaymentId,
   getBookingsByHost,
   getAllBookings,
   getBookingsDueForPayout,

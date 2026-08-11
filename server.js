@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const StellarSdk = require('stellar-sdk');
 const store = require('./store');
+const { splitBookingPayment } = require('./money');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -65,18 +66,48 @@ function requireAdmin(req, res, next) {
 // e.g. as listing ownerUid) could read or modify their data by simply
 // putting that uid in a request — the token proves the caller actually is
 // that user.
+// Verified tokens are cached so a browsing session doesn't hit Pi's API on
+// every single request — that would add a round-trip to each call and make
+// the whole app unavailable whenever Pi's API is slow or down. Keyed by a
+// hash rather than the token itself so raw credentials aren't held in memory.
+// Only successful lookups are cached: caching failures would lock a user out
+// for the full TTL after one transient network blip.
+const PI_UID_CACHE_TTL_MS = 5 * 60 * 1000;
+const PI_UID_CACHE_MAX = 1000;
+const PI_ME_TIMEOUT_MS = 8000;
+const piUidCache = new Map();
+
+function hashToken(token) {
+  return require('crypto').createHash('sha256').update(token).digest('hex');
+}
+
 async function resolvePiUid(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return null;
+
+  const key = hashToken(token);
+  const cached = piUidCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.uid;
+  if (cached) piUidCache.delete(key);
+
   try {
     const meRes = await fetch('https://api.minepi.com/v2/me', {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(PI_ME_TIMEOUT_MS),
     });
     if (!meRes.ok) return null;
     const me = await meRes.json();
-    return me.uid || null;
-  } catch {
+    if (!me.uid) return null;
+
+    // Map preserves insertion order, so the first key is the oldest entry.
+    if (piUidCache.size >= PI_UID_CACHE_MAX) {
+      piUidCache.delete(piUidCache.keys().next().value);
+    }
+    piUidCache.set(key, { uid: me.uid, expiresAt: Date.now() + PI_UID_CACHE_TTL_MS });
+    return me.uid;
+  } catch (err) {
+    console.error('[PiAuth] /v2/me verification failed:', err.message || err);
     return null;
   }
 }
@@ -264,12 +295,52 @@ app.get('/api/bookings/real-payment-eligibility', async (req, res) => {
   });
 });
 
+// ── Payment verification ────────────────────────────────────────────────────
+// Asks Pi's Platform API what a payment actually was. The booking body is
+// client-supplied, so its totalPi is a *claim*, not a fact — and totalPi is
+// what later decides how much real Pi leaves the app wallet as a host payout
+// or a refund. Taking it on trust would let anyone book with an invented
+// amount and drain the wallet. Everything that moves money must come from
+// this response, never from the request body.
+// Returns { ok, amount, uid, txid } or { ok: false, reason }.
+async function verifyPiPayment(paymentId) {
+  if (!PI_SERVER_API_KEY) return { ok: false, reason: 'not_configured' };
+  try {
+    const r = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+      headers: { Authorization: `Key ${PI_SERVER_API_KEY}` },
+      signal: AbortSignal.timeout(PI_ME_TIMEOUT_MS),
+    });
+    if (!r.ok) return { ok: false, reason: `lookup_failed_${r.status}` };
+    const p = await r.json();
+
+    const s = p.status || {};
+    if (s.cancelled || s.user_cancelled) return { ok: false, reason: 'cancelled' };
+    // transaction_verified means the Pi actually moved on-chain. Anything
+    // less and the guest has not really paid yet.
+    if (!s.transaction_verified) return { ok: false, reason: 'not_verified' };
+
+    const amount = Number(p.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return { ok: false, reason: 'bad_amount' };
+
+    return { ok: true, amount, uid: p.user_uid, txid: p.transaction?.txid };
+  } catch (err) {
+    console.error(`[PayVerify] ${paymentId}:`, err.message || err);
+    return { ok: false, reason: 'lookup_error' };
+  }
+}
+
 // ── Bookings: create ─────────────────────────────────────────────────────────
 app.post('/api/bookings', async (req, res) => {
   const b = req.body || {};
   const required = ['id', 'piUid', 'hotelId', 'roomType', 'checkIn', 'checkOut'];
   const missing = required.filter((k) => !b[k]);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  // Only the guest themselves may file their own booking — piUid decides whose
+  // booking this is and, on cancellation, who the refund is paid to.
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (callerUid !== b.piUid) return res.status(403).json({ error: 'Forbidden' });
 
   const isRealPaymentEarly = b.txid && !String(b.txid).startsWith('demo_');
   const listing = await store.getListingById(b.hotelId).catch(() => null);
@@ -294,10 +365,57 @@ app.post('/api/bookings', async (req, res) => {
     console.warn(`[Booking] ${b.id}: ${blocked ? 'host-blocked dates' : `conflict with ${conflict.id}`} on a real payment — needs admin review`);
   }
 
+  // Establish what was actually paid, from Pi rather than from the request.
+  // mockMode: with no server API key nothing here moves real Pi anyway, so
+  // local/dev flows keep working without a live payment to verify against.
+  const mockMode = !PI_SERVER_API_KEY;
+  let verifiedAmount = null;
+  let paymentIssue = null;
+
+  if (isRealPaymentEarly && !mockMode) {
+    if (!b.paymentId) {
+      paymentIssue = 'missing_payment_id';
+    } else {
+      const duplicate = await store.getBookingByPaymentId(b.paymentId);
+      if (duplicate) {
+        return res.status(409).json({
+          error: 'This payment has already been used for another booking',
+          bookingId: duplicate.id,
+        });
+      }
+      const verified = await verifyPiPayment(b.paymentId);
+      if (!verified.ok) paymentIssue = `unverified_${verified.reason}`;
+      else if (verified.uid !== b.piUid) paymentIssue = 'payment_belongs_to_another_user';
+      else verifiedAmount = verified.amount;
+    }
+    if (paymentIssue) {
+      console.warn(`[Booking] ${b.id}: payment not verified (${paymentIssue}) — payout withheld`);
+    }
+  }
+
+  // Whitelist what a client may set. Spreading the raw body would let a caller
+  // hand themselves payout/refund fields (hostPayoutAmount, refundStatus, …)
+  // that decide how much Pi leaves the app wallet.
   const booking = {
-    ...b,
-    status: b.status || 'confirmed',
+    id: String(b.id),
+    piUid: b.piUid,
+    hotelId: b.hotelId,
+    hotelName: b.hotelName,
+    roomType: b.roomType,
+    image: b.image,
+    location: b.location,
+    checkIn: b.checkIn,
+    checkOut: b.checkOut,
+    nights: b.nights,
+    guests: b.guests,
+    totalUsd: b.totalUsd,
+    totalPi: verifiedAmount ?? b.totalPi,
+    txid: b.txid,
+    paymentId: b.paymentId,
+    bookedAt: b.bookedAt,
+    status: b.status === 'cancelled' ? 'cancelled' : 'confirmed',
     createdAt: new Date().toISOString(),
+    ...(paymentIssue ? { flaggedUnverifiedPayment: paymentIssue } : {}),
     ...(conflict ? { flaggedDoubleBooked: true, conflictBookingId: conflict.id } : {}),
     ...(blocked ? { flaggedHostBlockedDates: true } : {}),
   };
@@ -320,12 +438,18 @@ app.post('/api/bookings', async (req, res) => {
   // payment and schedule a payout (minus platform commission) to the host,
   // released once the stay's checkout date passes. Static demo hotels have
   // no real host, so they're skipped — full amount is platform revenue as before.
-  if (listing && listing.ownerUid && listing.ownerUid !== b.piUid && b.totalPi) {
+  // Only arm a payout against money we know arrived: a payment Pi confirmed as
+  // verified (or local mock mode, where nothing is real). A demo txid or an
+  // unverifiable payment must never schedule real Pi out of the app wallet.
+  const payoutEligible = mockMode || (isRealPaymentEarly && !paymentIssue);
+
+  if (payoutEligible && listing && listing.ownerUid && listing.ownerUid !== b.piUid && booking.totalPi) {
     const commissionRate = await getPlatformCommissionRate();
+    const { platformFeeAmount, hostPayoutAmount } = splitBookingPayment(booking.totalPi, commissionRate);
     booking.hostUid = listing.ownerUid;
     booking.platformFeeRate = commissionRate;
-    booking.platformFeeAmount = Math.round(b.totalPi * commissionRate * 100) / 100;
-    booking.hostPayoutAmount = Math.round((b.totalPi - booking.platformFeeAmount) * 100) / 100;
+    booking.platformFeeAmount = platformFeeAmount;
+    booking.hostPayoutAmount = hostPayoutAmount;
     booking.hostPayoutStatus = 'held';
   }
 
@@ -483,15 +607,28 @@ async function releaseDuePayouts() {
 // ── Bookings: cancel ──────────────────────────────────────────────────────────
 app.post('/api/bookings/:id/cancel', async (req, res) => {
   const { id } = req.params;
-  const { piUid } = req.body || {};
-  if (!piUid) return res.status(400).json({ error: 'piUid required' });
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
   const existing = await store.getBookingById(id);
   if (!existing) return res.status(404).json({ error: 'Booking not found' });
-  if (existing.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (existing.piUid !== callerUid) return res.status(403).json({ error: 'Forbidden' });
 
   const alreadyCancelled = existing.status === 'cancelled';
   const isRealPayment = existing.txid && !String(existing.txid).startsWith('demo_');
-  const shouldRefund = !alreadyCancelled && isRealPayment && existing.totalPi && !existing.refundStatus;
+  // A refund sends real Pi out of the app wallet using the booking's stored
+  // totalPi. If that amount was never confirmed against the actual Pi payment,
+  // refunding it would pay out money the platform may never have received —
+  // an admin settles those by hand instead.
+  const shouldRefund =
+    !alreadyCancelled &&
+    isRealPayment &&
+    existing.totalPi &&
+    !existing.refundStatus &&
+    !existing.flaggedUnverifiedPayment;
+
+  if (!alreadyCancelled && isRealPayment && existing.flaggedUnverifiedPayment) {
+    console.warn(`[Refund] ${id}: withheld — payment was never verified (${existing.flaggedUnverifiedPayment})`);
+  }
   // If a host payout was held in escrow and hasn't gone out yet, cancelling
   // the booking cancels the payout too — the guest is getting refunded instead.
   const shouldCancelPayout = !alreadyCancelled && existing.hostUid && existing.hostPayoutStatus === 'held';
