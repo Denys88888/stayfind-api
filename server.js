@@ -30,7 +30,7 @@ app.use(cors({
     'http://localhost:5174',
     'http://localhost:5175',
   ],
-  allowedHeaders: ['Content-Type', 'x-admin-key'],
+  allowedHeaders: ['Content-Type', 'x-admin-key', 'Authorization'],
 }));
 
 // ── In-memory payment log (last 200 records) ───────────────────────────────
@@ -56,6 +56,30 @@ function requireAdmin(req, res, next) {
   const key = req.headers['x-admin-key'] || req.query.adminKey;
   if (key !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
   next();
+}
+
+// ── Pi identity middleware ──────────────────────────────────────────────────
+// Verifies the caller's Pi access token against the Platform API's /v2/me
+// endpoint and confirms it resolves to the :piUid / :hostUid in the URL.
+// Without this, anyone who knows another user's uid could read their
+// booking history or host earnings (uids appear elsewhere, e.g. listings).
+function requirePiIdentity(paramName) {
+  return async (req, res, next) => {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing access token' });
+    try {
+      const meRes = await fetch('https://api.minepi.com/v2/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!meRes.ok) return res.status(401).json({ error: 'Invalid access token' });
+      const me = await meRes.json();
+      if (me.uid !== req.params[paramName]) return res.status(403).json({ error: 'Forbidden' });
+      next();
+    } catch {
+      return res.status(401).json({ error: 'Could not verify access token' });
+    }
+  };
 }
 
 // ── Health ─────────────────────────────────────────────────────────────────
@@ -107,6 +131,38 @@ app.post('/api/payments/approve/:paymentId', async (req, res) => {
 });
 
 // ── Payments: complete ─────────────────────────────────────────────────────
+app.post('/api/payments/cancel/:paymentId', async (req, res) => {
+  const { paymentId } = req.params;
+
+  if (!PI_SERVER_API_KEY) {
+    console.log('[Mock] Cancel payment', paymentId);
+    updatePayment(paymentId, { status: 'cancelled' });
+    logPayment({ paymentId, action: 'cancel', status: 'cancelled', mock: true });
+    return res.json({ mock: true });
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.minepi.com/v2/payments/${paymentId}/cancel`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Key ${PI_SERVER_API_KEY}` },
+      }
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      logPayment({ paymentId, action: 'cancel', status: 'error', error: data });
+      return res.status(response.status).json(data);
+    }
+    updatePayment(paymentId, { status: 'cancelled' });
+    logPayment({ paymentId, action: 'cancel', status: 'cancelled', mock: false });
+    res.json(data);
+  } catch (err) {
+    console.error('[Cancel] Error:', err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 app.post('/api/payments/complete/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
@@ -269,13 +325,13 @@ app.post('/api/bookings', async (req, res) => {
 });
 
 // ── Bookings: list by user ───────────────────────────────────────────────────
-app.get('/api/bookings/:piUid', async (req, res) => {
+app.get('/api/bookings/:piUid', requirePiIdentity('piUid'), async (req, res) => {
   const { piUid } = req.params;
   res.json(await store.getBookingsByOwner(piUid));
 });
 
 // ── Bookings: earnings on a host's listings ─────────────────────────────────
-app.get('/api/bookings/host/:hostUid', async (req, res) => {
+app.get('/api/bookings/host/:hostUid', requirePiIdentity('hostUid'), async (req, res) => {
   res.json(await store.getBookingsByHost(req.params.hostUid));
 });
 
@@ -419,9 +475,10 @@ async function releaseDuePayouts() {
 app.post('/api/bookings/:id/cancel', async (req, res) => {
   const { id } = req.params;
   const { piUid } = req.body || {};
+  if (!piUid) return res.status(400).json({ error: 'piUid required' });
   const existing = await store.getBookingById(id);
   if (!existing) return res.status(404).json({ error: 'Booking not found' });
-  if (piUid && existing.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (existing.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
 
   const alreadyCancelled = existing.status === 'cancelled';
   const isRealPayment = existing.txid && !String(existing.txid).startsWith('demo_');
@@ -609,7 +666,7 @@ app.post('/api/admin/settings', requireAdmin, async (req, res) => {
     await store.setSetting('allowDemoBookings', allowDemoBookings);
   }
   if (typeof platformCommissionRate === 'number') {
-    if (platformCommissionRate < 0 || platformCommissionRate > 0.5) {
+    if (!Number.isFinite(platformCommissionRate) || platformCommissionRate < 0 || platformCommissionRate > 0.5) {
       return res.status(400).json({ error: 'platformCommissionRate must be between 0 and 0.5' });
     }
     await store.setSetting('platformCommissionRate', platformCommissionRate);
@@ -652,6 +709,23 @@ app.post('/api/listings', async (req, res) => {
   const required = ['ownerUid', 'name', 'location', 'address', 'price', 'description'];
   const missing = required.filter((k) => !l[k]);
   if (missing.length) return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
+
+  // Verify the caller actually owns the ownerUid they're submitting — without
+  // this, anyone could create a listing (and future payouts) under someone
+  // else's Pi identity.
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing access token' });
+  try {
+    const meRes = await fetch('https://api.minepi.com/v2/me', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!meRes.ok) return res.status(401).json({ error: 'Invalid access token' });
+    const me = await meRes.json();
+    if (me.uid !== l.ownerUid) return res.status(403).json({ error: 'Forbidden' });
+  } catch {
+    return res.status(401).json({ error: 'Could not verify access token' });
+  }
 
   const coordinates = await geocode(`${l.address}, ${l.location}`) || await geocode(l.location);
 
