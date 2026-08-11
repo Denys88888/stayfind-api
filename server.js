@@ -58,27 +58,36 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ── Pi identity middleware ──────────────────────────────────────────────────
-// Verifies the caller's Pi access token against the Platform API's /v2/me
-// endpoint and confirms it resolves to the :piUid / :hostUid in the URL.
-// Without this, anyone who knows another user's uid could read their
-// booking history or host earnings (uids appear elsewhere, e.g. listings).
+// ── Pi identity verification ────────────────────────────────────────────────
+// Resolves a Bearer access token to its Pi uid via the Platform API's /v2/me
+// endpoint. Returns the uid, or null if the token is missing/invalid.
+// Without this, anyone who knows another user's uid (uids appear elsewhere,
+// e.g. as listing ownerUid) could read or modify their data by simply
+// putting that uid in a request — the token proves the caller actually is
+// that user.
+async function resolvePiUid(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  try {
+    const meRes = await fetch('https://api.minepi.com/v2/me', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!meRes.ok) return null;
+    const me = await meRes.json();
+    return me.uid || null;
+  } catch {
+    return null;
+  }
+}
+
+// Middleware: verifies the caller's token resolves to the :paramName in the URL.
 function requirePiIdentity(paramName) {
   return async (req, res, next) => {
-    const auth = req.headers.authorization || '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Missing access token' });
-    try {
-      const meRes = await fetch('https://api.minepi.com/v2/me', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!meRes.ok) return res.status(401).json({ error: 'Invalid access token' });
-      const me = await meRes.json();
-      if (me.uid !== req.params[paramName]) return res.status(403).json({ error: 'Forbidden' });
-      next();
-    } catch {
-      return res.status(401).json({ error: 'Could not verify access token' });
-    }
+    const uid = await resolvePiUid(req);
+    if (!uid) return res.status(401).json({ error: 'Missing or invalid access token' });
+    if (uid !== req.params[paramName]) return res.status(403).json({ error: 'Forbidden' });
+    next();
   };
 }
 
@@ -713,19 +722,9 @@ app.post('/api/listings', async (req, res) => {
   // Verify the caller actually owns the ownerUid they're submitting — without
   // this, anyone could create a listing (and future payouts) under someone
   // else's Pi identity.
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing access token' });
-  try {
-    const meRes = await fetch('https://api.minepi.com/v2/me', {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!meRes.ok) return res.status(401).json({ error: 'Invalid access token' });
-    const me = await meRes.json();
-    if (me.uid !== l.ownerUid) return res.status(403).json({ error: 'Forbidden' });
-  } catch {
-    return res.status(401).json({ error: 'Could not verify access token' });
-  }
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (callerUid !== l.ownerUid) return res.status(403).json({ error: 'Forbidden' });
 
   const coordinates = await geocode(`${l.address}, ${l.location}`) || await geocode(l.location);
 
@@ -753,7 +752,7 @@ app.get('/api/listings', async (_req, res) => {
   res.json(await store.getApprovedListings());
 });
 
-app.get('/api/listings/owner/:piUid', async (req, res) => {
+app.get('/api/listings/owner/:piUid', requirePiIdentity('piUid'), async (req, res) => {
   res.json(await store.getListingsByOwner(req.params.piUid));
 });
 
@@ -768,12 +767,15 @@ app.get('/api/listings/:id', async (req, res) => {
 // independent of guest bookings. Checked by both the availability endpoint
 // (pre-payment) and booking creation (defense-in-depth).
 app.post('/api/listings/:id/block-dates', async (req, res) => {
-  const { piUid, checkIn, checkOut } = req.body || {};
-  if (!piUid || !checkIn || !checkOut) return res.status(400).json({ error: 'piUid, checkIn, checkOut required' });
+  const { checkIn, checkOut } = req.body || {};
+  if (!checkIn || !checkOut) return res.status(400).json({ error: 'checkIn, checkOut required' });
+
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
 
   const listing = await store.getListingById(req.params.id);
   if (!listing) return res.status(404).json({ error: 'Not found' });
-  if (listing.ownerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (listing.ownerUid !== callerUid) return res.status(403).json({ error: 'Forbidden' });
   if (new Date(checkIn) >= new Date(checkOut)) return res.status(400).json({ error: 'checkOut must be after checkIn' });
 
   const blockedRanges = [...(listing.blockedRanges || []), { checkIn, checkOut }];
@@ -782,12 +784,15 @@ app.post('/api/listings/:id/block-dates', async (req, res) => {
 });
 
 app.post('/api/listings/:id/unblock-dates', async (req, res) => {
-  const { piUid, index } = req.body || {};
-  if (!piUid || index == null) return res.status(400).json({ error: 'piUid, index required' });
+  const { index } = req.body || {};
+  if (index == null) return res.status(400).json({ error: 'index required' });
+
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
 
   const listing = await store.getListingById(req.params.id);
   if (!listing) return res.status(404).json({ error: 'Not found' });
-  if (listing.ownerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+  if (listing.ownerUid !== callerUid) return res.status(403).json({ error: 'Forbidden' });
 
   const blockedRanges = (listing.blockedRanges || []).filter((_, i) => i !== Number(index));
   const updated = await store.updateListing(req.params.id, { blockedRanges });
