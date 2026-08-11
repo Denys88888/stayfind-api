@@ -1075,6 +1075,12 @@ app.post('/api/reviews', async (req, res) => {
     return res.status(400).json({ error: 'rating must be between 1 and 5' });
   }
 
+  // Reviews are public and shape a host's reputation, so the author has to be
+  // the guest who actually stayed — a body-supplied piUid proves nothing.
+  const callerUid = await resolvePiUid(req);
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (callerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
+
   const booking = await store.getBookingById(bookingId);
   if (!booking) return res.status(404).json({ error: 'Booking not found' });
   if (booking.piUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
