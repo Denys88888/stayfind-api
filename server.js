@@ -132,6 +132,21 @@ app.get('/api/config', async (_req, res) => {
   res.json({ platformCommissionRate: await getPlatformCommissionRate() });
 });
 
+// ── Health ──────────────────────────────────────────────────────────────────
+// Deliberately unauthenticated and deliberately coarse: it answers "is this
+// deployment configured to keep people's bookings and to move real Pi?"
+// without naming hosts, versions or anything an attacker could act on.
+// `persistentStorage: false` means every restart wipes bookings and listings.
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    persistentStorage: !!store.isEnabled,
+    piPaymentsConfigured: !!PI_SERVER_API_KEY,
+    payoutsConfigured: !!PI_WALLET_PRIVATE_SEED,
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
+});
+
 // ── Payments: approve ──────────────────────────────────────────────────────
 app.post('/api/payments/approve/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
