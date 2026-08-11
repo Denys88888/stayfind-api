@@ -3,6 +3,7 @@ const cors = require('cors');
 const StellarSdk = require('stellar-sdk');
 const store = require('./store');
 const { splitBookingPayment } = require('./money');
+const pricing = require('./pricing');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -128,8 +129,14 @@ app.get('/health', (_req, res) => {
 });
 
 // ── Public config (no admin key needed — safe, non-sensitive values) ───────
+// The frontend reads its pricing rates from here rather than hardcoding them,
+// so the price a guest is charged always matches what the server expects.
 app.get('/api/config', async (_req, res) => {
-  res.json({ platformCommissionRate: await getPlatformCommissionRate() });
+  res.json({
+    platformCommissionRate: await getPlatformCommissionRate(),
+    piUsdRate: pricing.PI_USD_RATE,
+    taxRate: pricing.TAX_RATE,
+  });
 });
 
 // ── Health ──────────────────────────────────────────────────────────────────
@@ -403,6 +410,19 @@ app.post('/api/bookings', async (req, res) => {
       else if (verified.uid !== b.piUid) paymentIssue = 'payment_belongs_to_another_user';
       else verifiedAmount = verified.amount;
     }
+    // What was paid is now known; check it against what the stay actually
+    // costs. The browser decides the charge, so without this a guest could pay
+    // a token amount, hold the dates, and have the host paid that token amount
+    // minus commission. Only user-submitted listings have a server-side price
+    // to compare against; the static demo catalogue has none.
+    if (!paymentIssue && listing) {
+      const expectedPi = pricing.expectedTotalPi(listing.price, b.checkIn, b.checkOut);
+      if (pricing.isUnderpaid(verifiedAmount, expectedPi)) {
+        paymentIssue = `underpaid_${verifiedAmount}_of_${expectedPi}`;
+        console.warn(`[Booking] ${b.id}: paid ${verifiedAmount} π but stay costs ${expectedPi} π`);
+      }
+    }
+
     if (paymentIssue) {
       console.warn(`[Booking] ${b.id}: payment not verified (${paymentIssue}) — payout withheld`);
     }
