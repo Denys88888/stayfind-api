@@ -1175,13 +1175,20 @@ store.init()
     });
   });
 
-// ── Keep-alive: free-tier Render sleeps after idle; a cold start during
-//    payment approval breaks the Pi flow ("developer failed to approve").
-//    Self-ping every 10 min keeps the service warm.
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://stayfind-api.onrender.com';
-setInterval(() => {
-  fetch(`${SELF_URL}/health`).catch(() => {});
-}, 10 * 60 * 1000);
+// ── No keep-alive on purpose.
+//    A self-ping every 10 minutes used to sit here so the free instance never
+//    reached Render's 15-minute idle spin-down. Free instance hours are billed
+//    only while an instance runs, and the workspace pool is 750 a month against
+//    the 744 a single never-sleeping service costs — this ping and an identical
+//    one in taxi-pro-server exhausted the pool and suspended stayfind-backend,
+//    taxi-pro-server and pifix-api together on 22 Aug 2026.
+//
+//    It was guarding the wrong thing anyway. The worry was a cold start during
+//    payment approval ("developer failed to approve"), but the client calls
+//    /api/config on startup (src/main.tsx) and then listings, reviews and
+//    availability while the guest browses. Whoever reaches Checkout woke this
+//    service minutes ago. The cold start lands on the first page load, where it
+//    costs ~50s of waiting — not on the payment.
 
 // ── Escrow release: check every 30 min for bookings whose checkout date has
 //    passed and release the held payout to the host.
