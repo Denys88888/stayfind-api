@@ -154,6 +154,82 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+// ── Health: can we actually pay hosts? ──────────────────────────────────────
+// `payoutsConfigured` above only says a wallet seed is present. It does NOT
+// say Pi will let this app send App-to-User payments — that is a per-app
+// permission Pi grants separately, and an app can look fully configured while
+// every payout fails. A sibling app of this developer's hit exactly that:
+// payouts appeared to succeed for months while nothing reached anyone, ending
+// in a real debt to real people.
+//
+// So ask Pi directly, before any guest's money is on the line.
+//
+// The probe deliberately uses a recipient uid that cannot exist, so it can
+// never create a payment or move Pi no matter what Pi answers. We only care
+// which wall we hit:
+//   - "feature_not_available"  → A2U is switched off for this app
+//   - a complaint about the uid → A2U is on; it got past the feature gate
+// Result is cached for the life of the process: this is a deployment-level
+// fact, not something to re-ask on every request.
+let a2uProbe = null;
+
+async function probeA2UAvailability() {
+  if (a2uProbe) return a2uProbe;
+
+  if (!PI_SERVER_API_KEY) {
+    a2uProbe = { piAllowsPayouts: 'unknown', detail: 'no server API key configured' };
+    return a2uProbe;
+  }
+
+  try {
+    const r = await fetch('https://api.minepi.com/v2/payments', {
+      method: 'POST',
+      headers: { Authorization: `Key ${PI_SERVER_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payment: {
+          amount: 0.01,
+          memo: 'StayFind payout capability probe',
+          metadata: { probe: true },
+          // Not a real uid, and not derived from one — this must never resolve.
+          uid: 'stayfind-a2u-capability-probe-not-a-real-uid',
+        },
+      }),
+      signal: AbortSignal.timeout(PI_ME_TIMEOUT_MS),
+    });
+
+    const body = await r.text();
+    const marker = body.toLowerCase();
+
+    if (marker.includes('feature_not_available')) {
+      a2uProbe = {
+        piAllowsPayouts: 'no',
+        detail: 'Pi has not enabled App-to-User payments for this app — hosts cannot be paid and guests cannot be refunded',
+      };
+    } else if (r.ok) {
+      // Should be unreachable: the uid cannot exist. Treat as inconclusive
+      // rather than claiming success, and leave a loud trail.
+      console.error('[A2U probe] Pi accepted a payment to a non-existent uid — investigate:', body.slice(0, 300));
+      a2uProbe = { piAllowsPayouts: 'unknown', detail: 'probe unexpectedly accepted; see server logs' };
+    } else {
+      // Rejected for something other than the feature gate — i.e. it got past
+      // the gate and objected to the fake recipient. That is the good case.
+      a2uProbe = { piAllowsPayouts: 'yes', detail: 'Pi accepts App-to-User payments from this app' };
+    }
+  } catch (err) {
+    a2uProbe = { piAllowsPayouts: 'unknown', detail: `could not reach Pi: ${err.message || err}` };
+  }
+
+  return a2uProbe;
+}
+
+app.get('/api/health/payouts', async (_req, res) => {
+  const probe = await probeA2UAvailability();
+  res.json({
+    walletConfigured: !!PI_WALLET_PRIVATE_SEED,
+    ...probe,
+  });
+});
+
 // ── Payments: approve ──────────────────────────────────────────────────────
 app.post('/api/payments/approve/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
