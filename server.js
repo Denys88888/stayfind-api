@@ -222,11 +222,50 @@ async function probeA2UAvailability() {
   return a2uProbe;
 }
 
+// Permission to send is only half the question — the app wallet also has to
+// hold enough Pi to cover what it owes hosts. An empty wallet fails at the
+// blockchain step, after the guest has already paid, which is the worst place
+// to discover it. The seed never leaves this process: only the derived public
+// address (which is on-chain anyway, and truncated here) and the balance are
+// reported. Both Pi networks are tried because which one an app is on follows
+// its Pi registration, not anything in this code.
+async function readWalletBalance() {
+  if (!PI_WALLET_PRIVATE_SEED) return { walletBalance: null };
+
+  let address;
+  try {
+    address = StellarSdk.Keypair.fromSecret(PI_WALLET_PRIVATE_SEED).publicKey();
+  } catch {
+    return { walletBalance: null, walletDetail: 'PI_WALLET_PRIVATE_SEED is not a valid wallet key' };
+  }
+
+  for (const [network, horizonUrl] of Object.entries(HORIZON_URLS)) {
+    try {
+      const account = await new StellarSdk.Server(horizonUrl).loadAccount(address);
+      const native = account.balances.find((b) => b.asset_type === 'native');
+      return {
+        walletBalance: native ? Number(native.balance) : 0,
+        walletNetwork: network,
+        walletAddress: `${address.slice(0, 6)}…${address.slice(-6)}`,
+      };
+    } catch {
+      // Not funded on this network — try the other before giving up.
+    }
+  }
+
+  return {
+    walletBalance: 0,
+    walletDetail: 'wallet not found on either Pi network — it has never been funded',
+    walletAddress: `${address.slice(0, 6)}…${address.slice(-6)}`,
+  };
+}
+
 app.get('/api/health/payouts', async (_req, res) => {
-  const probe = await probeA2UAvailability();
+  const [probe, wallet] = await Promise.all([probeA2UAvailability(), readWalletBalance()]);
   res.json({
     walletConfigured: !!PI_WALLET_PRIVATE_SEED,
     ...probe,
+    ...wallet,
   });
 });
 
