@@ -269,6 +269,22 @@ app.get('/api/health/payouts', async (_req, res) => {
   });
 });
 
+// ── Health: what is the client actually? ────────────────────────────────────
+// index.html decides `Pi.init({ sandbox })` from whether the User-Agent
+// contains "PiBrowser". Inside real Pi Browser `sandbox: true` makes
+// Pi.authenticate never call back — a hang with no error — so getting that
+// test wrong silently locks every on-device user out at login, and the only
+// way to know is to see the real header. Echoes back the caller's own
+// User-Agent; reveals nothing they did not send.
+app.get('/api/health/client', (req, res) => {
+  const ua = req.headers['user-agent'] || '';
+  res.json({
+    userAgent: ua,
+    matchesPiBrowserRegex: /PiBrowser/i.test(ua),
+    sandboxThisClientWouldGet: !/PiBrowser/i.test(ua),
+  });
+});
+
 // ── Payments: approve ──────────────────────────────────────────────────────
 app.post('/api/payments/approve/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
