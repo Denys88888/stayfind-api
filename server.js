@@ -82,10 +82,17 @@ function hashToken(token) {
   return require('crypto').createHash('sha256').update(token).digest('hex');
 }
 
+/** Why the last rejection happened, so a 401 can say more than "invalid".
+ *  Holds only Pi's own status/message — never any part of a token. */
+let lastAuthFailure = null;
+
 async function resolvePiUid(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return null;
+  if (!token) {
+    lastAuthFailure = 'no Authorization header';
+    return null;
+  }
 
   const key = hashToken(token);
   const cached = piUidCache.get(key);
@@ -97,9 +104,17 @@ async function resolvePiUid(req) {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(PI_ME_TIMEOUT_MS),
     });
-    if (!meRes.ok) return null;
+    if (!meRes.ok) {
+      const body = (await meRes.text().catch(() => '')).slice(0, 200);
+      lastAuthFailure = `Pi /v2/me → ${meRes.status}: ${body}`;
+      console.error('[PiAuth]', lastAuthFailure);
+      return null;
+    }
     const me = await meRes.json();
-    if (!me.uid) return null;
+    if (!me.uid) {
+      lastAuthFailure = 'Pi /v2/me returned no uid';
+      return null;
+    }
 
     // Map preserves insertion order, so the first key is the oldest entry.
     if (piUidCache.size >= PI_UID_CACHE_MAX) {
@@ -108,16 +123,22 @@ async function resolvePiUid(req) {
     piUidCache.set(key, { uid: me.uid, expiresAt: Date.now() + PI_UID_CACHE_TTL_MS });
     return me.uid;
   } catch (err) {
-    console.error('[PiAuth] /v2/me verification failed:', err.message || err);
+    lastAuthFailure = `could not reach Pi /v2/me: ${err.message || err}`;
+    console.error('[PiAuth]', lastAuthFailure);
     return null;
   }
+}
+
+/** Surfaces why auth failed. Diagnostic only — Pi's status text, no token. */
+function authFailureReason() {
+  return lastAuthFailure || 'unknown';
 }
 
 // Middleware: verifies the caller's token resolves to the :paramName in the URL.
 function requirePiIdentity(paramName) {
   return async (req, res, next) => {
     const uid = await resolvePiUid(req);
-    if (!uid) return res.status(401).json({ error: 'Missing or invalid access token' });
+    if (!uid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
     if (uid !== req.params[paramName]) return res.status(403).json({ error: 'Forbidden' });
     next();
   };
@@ -508,7 +529,7 @@ app.post('/api/bookings', async (req, res) => {
   // Only the guest themselves may file their own booking — piUid decides whose
   // booking this is and, on cancellation, who the refund is paid to.
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
   if (callerUid !== b.piUid) return res.status(403).json({ error: 'Forbidden' });
 
   const isRealPaymentEarly = b.txid && !String(b.txid).startsWith('demo_');
@@ -835,7 +856,7 @@ async function releaseDuePayouts() {
 app.post('/api/bookings/:id/cancel', async (req, res) => {
   const { id } = req.params;
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
   const existing = await store.getBookingById(id);
   if (!existing) return res.status(404).json({ error: 'Booking not found' });
   if (existing.piUid !== callerUid) return res.status(403).json({ error: 'Forbidden' });
@@ -1120,7 +1141,7 @@ app.post('/api/listings', async (req, res) => {
   // this, anyone could create a listing (and future payouts) under someone
   // else's Pi identity.
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
   if (callerUid !== l.ownerUid) return res.status(403).json({ error: 'Forbidden' });
 
   const coordinates = await geocode(`${l.address}, ${l.location}`) || await geocode(l.location);
@@ -1168,7 +1189,7 @@ app.post('/api/listings/:id/block-dates', async (req, res) => {
   if (!checkIn || !checkOut) return res.status(400).json({ error: 'checkIn, checkOut required' });
 
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
 
   const listing = await store.getListingById(req.params.id);
   if (!listing) return res.status(404).json({ error: 'Not found' });
@@ -1185,7 +1206,7 @@ app.post('/api/listings/:id/unblock-dates', async (req, res) => {
   if (index == null) return res.status(400).json({ error: 'index required' });
 
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
 
   const listing = await store.getListingById(req.params.id);
   if (!listing) return res.status(404).json({ error: 'Not found' });
@@ -1225,7 +1246,7 @@ app.post('/api/reviews', async (req, res) => {
   // Reviews are public and shape a host's reputation, so the author has to be
   // the guest who actually stayed — a body-supplied piUid proves nothing.
   const callerUid = await resolvePiUid(req);
-  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token' });
+  if (!callerUid) return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
   if (callerUid !== piUid) return res.status(403).json({ error: 'Forbidden' });
 
   const booking = await store.getBookingById(bookingId);
