@@ -303,6 +303,10 @@ app.get('/api/health/client', (req, res) => {
     userAgent: ua,
     matchesPiBrowserRegex: /PiBrowser/i.test(ua),
     sandboxThisClientWouldGet: !/PiBrowser/i.test(ua),
+    // Why the most recent token rejection happened, so a failure seen in the
+    // app can be read back without dashboard log access. Pi's own status
+    // text only — never any part of a token.
+    lastAuthFailure: authFailureReason(),
   });
 });
 
