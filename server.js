@@ -9,7 +9,22 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const PI_SERVER_API_KEY = process.env.PI_SERVER_API_KEY;
 const PI_WALLET_PRIVATE_SEED = process.env.PI_WALLET_PRIVATE_SEED;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'stayfind-admin-dev';
+// Break-glass only. Admin access is normally granted by Pi uid (see the
+// admins table); this shared key stays as a way in if Pi's API is down or the
+// owner loses their account. No default value on purpose — a well-known
+// fallback like 'stayfind-admin-dev' is an open door on any deployment that
+// forgets to set the variable. Unset means the key path is simply closed.
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+
+// The one account allowed to take the first admin seat, matched against the
+// username Pi's /v2/me reports for the caller's token. This is a bootstrap
+// filter, NOT how admin authority is decided — that is the uid recorded in
+// the admins table, and this name is never consulted again afterwards.
+const OWNER_PI_USERNAME = (process.env.OWNER_PI_USERNAME || 'Cherry19899').toLowerCase();
+
+function isOwnerUsername(username) {
+  return !!username && username.toLowerCase() === OWNER_PI_USERNAME;
+}
 
 // Pi blockchain Horizon endpoints (per Pi Platform docs — separate from the
 // Platform API host). Picked based on the network the A2U payment reports.
@@ -53,16 +68,49 @@ function updatePayment(paymentId, update) {
   if (idx !== -1) Object.assign(payments[idx], update);
 }
 
-// ── Admin key middleware ───────────────────────────────────────────────────
-function requireAdmin(req, res, next) {
+// ── Admin authorization ────────────────────────────────────────────────────
+// Two ways in, in order of preference:
+//
+//   1. A Pi access token whose uid sits in the admins table. This is the real
+//      gate. The uid comes from Pi's /v2/me, so it cannot be asserted by the
+//      caller — unlike a username in a request body, which is how WorkPro
+//      once handed admin to anyone who typed the owner's name.
+//   2. The shared ADMIN_KEY, kept only as break-glass and only when one is
+//      configured. A shared secret is weaker: it can be copied, it ends up in
+//      browser storage, and it says nothing about who used it.
+//
+// Declared before the Pi identity helpers it calls — function declarations
+// hoist, and the middleware only runs once a request arrives.
+async function requireAdmin(req, res, next) {
+  let identity = null;
+  try {
+    identity = await resolvePiIdentity(req);
+    if (identity && await store.isAdminUid(identity.uid)) {
+      req.admin = identity;
+      return next();
+    }
+  } catch (err) {
+    // A database hiccup must not crash the process on an unhandled rejection,
+    // and must not become an accidental grant either — fall through to the key.
+    console.error('[Admin] identity check failed:', err);
+  }
+
   const key = req.headers['x-admin-key'] || req.query.adminKey;
-  if (key !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
-  next();
+  if (ADMIN_KEY && key === ADMIN_KEY) {
+    req.admin = { uid: null, username: null, viaKey: true };
+    return next();
+  }
+
+  return res.status(403).json({
+    error: 'Forbidden',
+    reason: identity ? 'this Pi account is not an admin' : 'no admin identity or key',
+  });
 }
 
 // ── Pi identity verification ────────────────────────────────────────────────
-// Resolves a Bearer access token to its Pi uid via the Platform API's /v2/me
-// endpoint. Returns the uid, or null if the token is missing/invalid.
+// Resolves a Bearer access token to its Pi identity via the Platform API's
+// /v2/me endpoint. Returns { uid, username }, or null if the token is
+// missing/invalid.
 // Without this, anyone who knows another user's uid (uids appear elsewhere,
 // e.g. as listing ownerUid) could read or modify their data by simply
 // putting that uid in a request — the token proves the caller actually is
@@ -86,7 +134,7 @@ function hashToken(token) {
  *  Holds only Pi's own status/message — never any part of a token. */
 let lastAuthFailure = null;
 
-async function resolvePiUid(req) {
+async function resolvePiIdentity(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) {
@@ -96,7 +144,7 @@ async function resolvePiUid(req) {
 
   const key = hashToken(token);
   const cached = piUidCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.uid;
+  if (cached && cached.expiresAt > Date.now()) return cached.identity;
   if (cached) piUidCache.delete(key);
 
   try {
@@ -120,13 +168,22 @@ async function resolvePiUid(req) {
     if (piUidCache.size >= PI_UID_CACHE_MAX) {
       piUidCache.delete(piUidCache.keys().next().value);
     }
-    piUidCache.set(key, { uid: me.uid, expiresAt: Date.now() + PI_UID_CACHE_TTL_MS });
-    return me.uid;
+    // username only arrives when the app asked for the `username` scope; it is
+    // informational, never the thing an authority check is decided on.
+    const identity = { uid: me.uid, username: me.username || null };
+    piUidCache.set(key, { identity, expiresAt: Date.now() + PI_UID_CACHE_TTL_MS });
+    return identity;
   } catch (err) {
     lastAuthFailure = `could not reach Pi /v2/me: ${err.message || err}`;
     console.error('[PiAuth]', lastAuthFailure);
     return null;
   }
+}
+
+/** The uid alone, for the many callers that don't care about the username. */
+async function resolvePiUid(req) {
+  const identity = await resolvePiIdentity(req);
+  return identity ? identity.uid : null;
 }
 
 /** Surfaces why auth failed. Diagnostic only — Pi's status text, no token. */
@@ -960,6 +1017,66 @@ app.post('/api/admin/bookings/:id/release-payout', requireAdmin, async (req, res
   res.json(await store.getBookingById(booking.id));
 });
 
+// ── Admin: who is calling ──────────────────────────────────────────────────
+// Deliberately not behind requireAdmin: the admin screen asks this first, to
+// find out whether the signed-in Pi account is an admin, can become the first
+// one, or is simply not allowed. Everything it returns is about the caller's
+// own token, so an authenticated non-admin learning they are not an admin
+// gives nothing away.
+app.get('/api/admin/whoami', async (req, res) => {
+  const identity = await resolvePiIdentity(req);
+  if (!identity) {
+    return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
+  }
+  const [isAdmin, adminCount] = await Promise.all([
+    store.isAdminUid(identity.uid),
+    store.countAdmins(),
+  ]);
+  res.json({
+    uid: identity.uid,
+    username: identity.username,
+    isAdmin,
+    adminCount,
+    canClaim: !isAdmin && adminCount === 0 && isOwnerUsername(identity.username),
+    // Without Postgres the seat lives in memory and is lost on every restart,
+    // so the panel can warn instead of looking permanently broken.
+    persistent: store.isPersistent(),
+  });
+});
+
+// ── Admin: claim the first seat ────────────────────────────────────────────
+// Runs once in the lifetime of the database. After it, admin is a uid in the
+// admins table and the owner's username is never consulted again — so a
+// username change, or Pi reassigning the name later, cannot move the seat.
+app.post('/api/admin/claim', async (req, res) => {
+  const identity = await resolvePiIdentity(req);
+  if (!identity) {
+    return res.status(401).json({ error: 'Missing or invalid access token', reason: authFailureReason() });
+  }
+  if (await store.isAdminUid(identity.uid)) {
+    return res.json({ ok: true, alreadyAdmin: true, uid: identity.uid });
+  }
+  if (!identity.username) {
+    return res.status(403).json({ error: 'Forbidden', reason: 'Pi returned no username for this token (missing username scope)' });
+  }
+  if (!isOwnerUsername(identity.username)) {
+    console.warn(`[Admin] claim refused: @${identity.username} (${identity.uid}) is not the owner account`);
+    return res.status(403).json({ error: 'Forbidden', reason: 'not the owner account' });
+  }
+
+  const row = await store.claimFirstAdmin(identity.uid, identity.username);
+  if (!row) {
+    return res.status(409).json({ error: 'Admin has already been claimed' });
+  }
+  console.log(`[Admin] first seat claimed by @${row.username} (${row.piUid})`);
+  res.json({ ok: true, uid: row.piUid, username: row.username });
+});
+
+// ── Admin: who holds a seat ────────────────────────────────────────────────
+app.get('/api/admin/admins', requireAdmin, async (_req, res) => {
+  res.json(await store.listAdmins());
+});
+
 // ── Admin: stats ───────────────────────────────────────────────────────────
 app.get('/api/admin/stats', requireAdmin, (_req, res) => {
   const today = new Date().toISOString().slice(0, 10);
@@ -1322,7 +1439,14 @@ store.init()
       if (!PI_SERVER_API_KEY) {
         console.warn('PI_SERVER_API_KEY not set — running in mock mode');
       }
-      console.log(`Admin key: ${ADMIN_KEY === 'stayfind-admin-dev' ? 'DEFAULT (set ADMIN_KEY env var!)' : 'CUSTOM'}`);
+      store.countAdmins()
+        .then((n) => console.log(
+          n > 0
+            ? `Admin: ${n} Pi account(s) hold a seat`
+            : `Admin: no seat taken yet — @${OWNER_PI_USERNAME} can claim it at /admin`
+        ))
+        .catch((err) => console.error('[Admin] could not count seats:', err));
+      console.log(`Admin break-glass key: ${ADMIN_KEY ? 'configured' : 'not set (Pi identity only)'}`);
       console.log(`Platform commission (default, overridable in /admin): ${(DEFAULT_PLATFORM_COMMISSION_RATE * 100).toFixed(1)}%`);
       if (!store.isPersistent() || !PI_WALLET_PRIVATE_SEED) {
         console.warn('REAL Pi PAYMENTS ARE REFUSED: needs a working DATABASE_URL and PI_WALLET_PRIVATE_SEED');

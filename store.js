@@ -99,6 +99,19 @@ async function initSchema() {
     );
   `);
 
+  // Who may use the admin panel. The uid is the authority: it is what Pi's own
+  // /v2/me asserts about the caller, and it cannot be handed to anyone else.
+  // A username can be reassigned and a shared key can be copied or leaked, so
+  // neither belongs here as the grant. The username column exists only so a
+  // human can read who holds the seat.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admins (
+      pi_uid TEXT PRIMARY KEY,
+      username TEXT,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
   console.log('[Store] Postgres connected, tables ready');
 }
 
@@ -109,6 +122,7 @@ const memBookings = [];
 const memListings = [];
 const memReviews = [];
 const memSettings = {};
+const memAdmins = [];
 
 function datesOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
@@ -470,6 +484,82 @@ async function setSetting(key, value) {
   return value;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Admins (authority is the Pi uid, never a username or a shared key)  */
+/* ------------------------------------------------------------------ */
+
+async function isAdminUid(uid) {
+  if (!uid) return false;
+  if (pool) {
+    const { rows } = await pool.query(`SELECT 1 FROM admins WHERE pi_uid = $1`, [uid]);
+    return rows.length > 0;
+  }
+  return memAdmins.some(a => a.piUid === uid);
+}
+
+async function countAdmins() {
+  if (pool) {
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM admins`);
+    return rows[0].n;
+  }
+  return memAdmins.length;
+}
+
+async function listAdmins() {
+  if (pool) {
+    const { rows } = await pool.query(
+      `SELECT pi_uid, username, added_at FROM admins ORDER BY added_at`
+    );
+    return rows.map(r => ({ piUid: r.pi_uid, username: r.username, addedAt: r.added_at }));
+  }
+  return memAdmins.map(a => ({ ...a }));
+}
+
+/**
+ * Takes the very first admin seat. Returns the new row, or null if a seat was
+ * already taken — so the bootstrap can happen exactly once in the lifetime of
+ * the database.
+ *
+ * The emptiness test and the insert run inside one transaction that first
+ * takes an exclusive lock. A plain "SELECT, then INSERT if empty" is not
+ * enough: under READ COMMITTED neither transaction sees the other's
+ * uncommitted row, so two simultaneous claims by different people would both
+ * find the table empty and both succeed.
+ */
+async function claimFirstAdmin(uid, username) {
+  if (!uid) throw new Error('claimFirstAdmin requires a uid');
+  if (pool) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('LOCK TABLE admins IN EXCLUSIVE MODE');
+      const { rows: taken } = await client.query(`SELECT 1 FROM admins LIMIT 1`);
+      if (taken.length > 0) {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const { rows } = await client.query(
+        `INSERT INTO admins (pi_uid, username) VALUES ($1, $2)
+         RETURNING pi_uid, username, added_at`,
+        [uid, username || null]
+      );
+      await client.query('COMMIT');
+      return { piUid: rows[0].pi_uid, username: rows[0].username, addedAt: rows[0].added_at };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  // Single-threaded and no await between the check and the push, so this is
+  // already atomic. Do not introduce one.
+  if (memAdmins.length > 0) return null;
+  const row = { piUid: uid, username: username || null, addedAt: new Date().toISOString() };
+  memAdmins.push(row);
+  return { ...row };
+}
+
 module.exports = {
   isEnabled,
   isPersistent,
@@ -499,4 +589,8 @@ module.exports = {
   deleteReview,
   getSetting,
   setSetting,
+  isAdminUid,
+  countAdmins,
+  listAdmins,
+  claimFirstAdmin,
 };
